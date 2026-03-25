@@ -91,3 +91,56 @@ input[type="text"] {
   font-size: 13px;
   color: #888;
 }
+
+.divider {
+  width: 100%;
+  max-width: 580px;
+  height: 1px;
+  background: #333;
+  margin: 12px 0;
+}
+
+h2 {
+  font-size: 20px;
+  font-weight: 400;
+}
+
+.nca-controls {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.file-upload-btn {
+  padding: 8px 20px;
+  border: 1px solid #555;
+  border-radius: 6px;
+  background: #2a2a4a;
+  color: #e0e0e0;
+  font-size: 14px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.file-upload-btn:hover {
+  background: #3a3a6a;
+}
+
+.nca-canvas-container {
+  border: 2px solid #444;
+  background: #000;
+}
+
+#nca-canvas {
+  display: block;
+  cursor: crosshair;
+  width: 576px;
+  height: 576px;
+}
+
+button:disabled, input:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
