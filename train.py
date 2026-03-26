@@ -18,7 +18,6 @@ import argparse
 import base64
 import json
 import os
-import struct
 import time
 from pathlib import Path
 
@@ -30,22 +29,40 @@ from PIL import Image, ImageDraw, ImageFont
 
 from nca_model import NCAModel
 
-# --- Hyperparameters (from the paper) ---
-CHANNEL_N = 16
-HIDDEN_N = 128
-FIRE_RATE = 0.5
-POOL_SIZE = 1024
-BATCH_SIZE = 8
-DAMAGE_N = 3  # number of best samples to damage each step
-TARGET_SIZE = 40
-TARGET_PADDING = 16
+# --- Default hyperparameters (from the paper) ---
+DEFAULTS = {
+    "channel_n": 16,
+    "hidden_n": 128,
+    "fire_rate": 0.5,
+    "pool_size": 1024,
+    "batch_size": 8,
+    "damage_n": 3,
+    "target_size": 40,
+    "target_padding": 16,
+    "lr_initial": 2e-3,
+    "lr_decay_step": 2000,
+    "lr_decay_factor": 0.1,
+    "steps": 8000,
+    "min_nca_steps": 64,
+    "max_nca_steps": 96,
+}
+
+# Module-level aliases for helpers that use these (load_target, make_seed, etc.)
+CHANNEL_N = DEFAULTS["channel_n"]
+HIDDEN_N = DEFAULTS["hidden_n"]
+FIRE_RATE = DEFAULTS["fire_rate"]
+POOL_SIZE = DEFAULTS["pool_size"]
+BATCH_SIZE = DEFAULTS["batch_size"]
+DAMAGE_N = DEFAULTS["damage_n"]
+TARGET_SIZE = DEFAULTS["target_size"]
+TARGET_PADDING = DEFAULTS["target_padding"]
 GRID_SIZE = TARGET_SIZE + 2 * TARGET_PADDING  # 72
-LR_INITIAL = 2e-3
-LR_DECAY_STEP = 2000
-LR_DECAY_FACTOR = 0.1
-TRAIN_STEPS = 8000
-MIN_NCA_STEPS = 64
-MAX_NCA_STEPS = 96
+LR_INITIAL = DEFAULTS["lr_initial"]
+LR_DECAY_STEP = DEFAULTS["lr_decay_step"]
+LR_DECAY_FACTOR = DEFAULTS["lr_decay_factor"]
+TRAIN_STEPS = DEFAULTS["steps"]
+MIN_NCA_STEPS = DEFAULTS["min_nca_steps"]
+MAX_NCA_STEPS = DEFAULTS["max_nca_steps"]
 
 
 # --- Sample Pool ---
@@ -91,11 +108,39 @@ def get_device():
     return torch.device("cpu")
 
 
-def make_seed(channel_n=CHANNEL_N, grid_size=GRID_SIZE):
-    """Seed state: all zeros, center pixel has alpha + hidden channels = 1.0."""
+def find_seed_position(target_np, padding=TARGET_PADDING):
+    """Find the best seed position: the opaque pixel closest to the character's centroid.
+
+    Args:
+        target_np: [1, 4, H, W] padded target (in grid coordinates)
+        padding: target padding size
+    Returns:
+        (seed_y, seed_x) in grid coordinates
+    """
+    alpha = target_np[0, 3]  # [H, W]
+    ys, xs = np.where(alpha > 0.5)
+    if len(ys) == 0:
+        # No opaque pixels — fall back to grid center
+        return alpha.shape[0] // 2, alpha.shape[1] // 2
+    centroid_y = ys.mean()
+    centroid_x = xs.mean()
+    # Find the opaque pixel closest to the centroid
+    dists = (ys - centroid_y) ** 2 + (xs - centroid_x) ** 2
+    closest = dists.argmin()
+    return int(ys[closest]), int(xs[closest])
+
+
+def make_seed(channel_n=CHANNEL_N, grid_size=GRID_SIZE, seed_y=None, seed_x=None):
+    """Seed state: all zeros, one pixel has alpha + hidden channels = 1.0.
+
+    If seed_y/seed_x are None, defaults to grid center.
+    """
     seed = np.zeros([1, channel_n, grid_size, grid_size], np.float32)
-    mid = grid_size // 2
-    seed[0, 3:, mid, mid] = 1.0  # alpha=1, hidden=1, RGB=0
+    if seed_y is None:
+        seed_y = grid_size // 2
+    if seed_x is None:
+        seed_x = grid_size // 2
+    seed[0, 3:, seed_y, seed_x] = 1.0
     return seed
 
 
@@ -263,50 +308,69 @@ def export_weights(model, output_dir):
 # --- Training ---
 
 
-def train(args):
+def train(config: dict):
+    """Train a single NCA model.
+
+    Args:
+        config: dict with keys:
+            target (str): path to 40x40 RGBA target PNG
+            output_dir (str): where to write outputs
+            resume (str|None): checkpoint path to resume from
+            char (str|None): character to generate if no target
+            + any keys from DEFAULTS to override hyperparameters
+    """
+    # Merge with defaults
+    p = {**DEFAULTS, **config}
+    target_path = p.get("target")
+    output_dir = Path(p["output_dir"])
+    resume = p.get("resume")
+    grid_size = p["target_size"] + 2 * p["target_padding"]
+
     device = get_device()
     print(f"Device: {device}")
 
-    # Output directories
-    output_dir = Path(args.output_dir)
     vis_dir = output_dir / "vis"
     vis_dir.mkdir(parents=True, exist_ok=True)
 
     # Load or generate target
-    if args.target:
-        target_np = load_target(args.target)
-        print(f"Loaded target: {args.target}")
+    if target_path:
+        target_np = load_target(target_path, p["target_size"], p["target_padding"])
+        print(f"Loaded target: {target_path}")
     else:
-        char = args.char or "R"
-        target_path = output_dir / f"target_{char}.png"
-        generate_test_target(char, str(target_path))
-        target_np = load_target(str(target_path))
-        print(f"Generated test target for '{char}' at {target_path}")
+        char = p.get("char") or "R"
+        gen_path = output_dir / f"target_{char}.png"
+        generate_test_target(char, str(gen_path))
+        target_np = load_target(str(gen_path), p["target_size"], p["target_padding"])
+        print(f"Generated test target for '{char}' at {gen_path}")
 
-    target = torch.from_numpy(target_np).to(device)  # [1, 4, H, W]
-    target_batch = target.expand(BATCH_SIZE, -1, -1, -1)  # [B, 4, H, W]
+    target = torch.from_numpy(target_np).to(device)
+    target_batch = target.expand(p["batch_size"], -1, -1, -1)
 
     # Model
-    model = NCAModel(CHANNEL_N, HIDDEN_N, FIRE_RATE).to(device)
-    param_count = sum(p.numel() for p in model.parameters())
+    model = NCAModel(p["channel_n"], p["hidden_n"], p["fire_rate"]).to(device)
+    param_count = sum(param.numel() for param in model.parameters())
     print(f"Model parameters: {param_count:,}")
 
-    # Optimizer + LR schedule (2e-3 for steps 0-1999, 2e-4 for steps 2000+)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR_INITIAL)
+    # Optimizer + LR schedule
+    optimizer = torch.optim.Adam(model.parameters(), lr=p["lr_initial"])
+    decay_step = p["lr_decay_step"]
+    decay_factor = p["lr_decay_factor"]
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
-        lr_lambda=lambda step: 1.0 if step < LR_DECAY_STEP else LR_DECAY_FACTOR,
+        lr_lambda=lambda step: 1.0 if step < decay_step else decay_factor,
     )
 
-    # Seed and pool
-    seed = make_seed()
-    pool = SamplePool(x=np.repeat(seed, POOL_SIZE, axis=0))
+    # Seed and pool — place seed at the opaque pixel closest to the character centroid
+    seed_y, seed_x = find_seed_position(target_np, p["target_padding"])
+    print(f"Seed position: ({seed_x}, {seed_y}) in grid coordinates")
+    seed = make_seed(p["channel_n"], grid_size, seed_y, seed_x)
+    pool = SamplePool(x=np.repeat(seed, p["pool_size"], axis=0))
 
     # Resume
     start_step = 0
     losses = []
-    if args.resume:
-        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+    if resume:
+        ckpt = torch.load(resume, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         if "scheduler" in ckpt:
@@ -321,36 +385,31 @@ def train(args):
     # Training loop
     t0 = time.time()
     model.train()
+    total_steps = p["steps"]
 
-    for step in range(start_step, args.steps):
-        # 1. Sample batch from pool
-        batch = pool.sample(BATCH_SIZE)
+    for step in range(start_step, total_steps):
+        batch = pool.sample(p["batch_size"])
         x0 = batch.x.copy()
 
-        # 2. Sort by loss descending (highest loss first)
         with torch.no_grad():
             x0_t = torch.from_numpy(x0).to(device)
             sample_losses = loss_fn(x0_t, target_batch).cpu().numpy()
         loss_rank = sample_losses.argsort()[::-1].copy()
         x0 = x0[loss_rank]
 
-        # 3. Replace highest-loss sample with fresh seed
         x0[:1] = seed
 
-        # 4. Damage the best (lowest-loss) samples with circular masks
-        if DAMAGE_N > 0:
-            masks = make_circle_masks(DAMAGE_N, GRID_SIZE, GRID_SIZE)
-            damage = 1.0 - masks[:, np.newaxis, :, :]  # [N, 1, H, W]
-            x0[-DAMAGE_N:] *= damage
+        if p["damage_n"] > 0:
+            masks = make_circle_masks(p["damage_n"], grid_size, grid_size)
+            damage = 1.0 - masks[:, np.newaxis, :, :]
+            x0[-p["damage_n"] :] *= damage
 
-        # 5. Forward: run NCA for random [64, 96) steps
         x = torch.from_numpy(x0).to(device)
-        iter_n = np.random.randint(MIN_NCA_STEPS, MAX_NCA_STEPS)
+        iter_n = np.random.randint(p["min_nca_steps"], p["max_nca_steps"])
 
         for _ in range(iter_n):
             x = model(x)
 
-        # 6. Loss + backward
         loss_per_sample = loss_fn(x, target_batch)
         loss = loss_per_sample.mean()
 
@@ -360,11 +419,9 @@ def train(args):
         optimizer.step()
         scheduler.step()
 
-        # 7. Write states back to pool (undo the sort permutation)
         batch.x[loss_rank] = x.detach().cpu().numpy()
         batch.commit()
 
-        # --- Logging ---
         loss_val = loss.item()
         losses.append(loss_val)
 
@@ -372,7 +429,7 @@ def train(args):
             elapsed = time.time() - t0
             lr = optimizer.param_groups[0]["lr"]
             print(
-                f"  Step {step:5d}/{args.steps}"
+                f"  Step {step:5d}/{total_steps}"
                 f"  loss={loss_val:.6f}"
                 f"  lr={lr:.1e}"
                 f"  ({elapsed:.0f}s)"
@@ -398,18 +455,15 @@ def train(args):
 
     # --- Final outputs ---
     total_time = time.time() - t0
-    print(f"\nTraining complete. {args.steps} steps in {total_time:.0f}s")
+    print(f"\nTraining complete. {total_steps} steps in {total_time:.0f}s")
 
-    # Final checkpoint (model-only, no pool — smaller file)
     torch.save(
-        {"step": args.steps, "model": model.state_dict(), "losses": losses},
+        {"step": total_steps, "model": model.state_dict(), "losses": losses},
         str(output_dir / "checkpoint_final.pt"),
     )
 
-    # Export weights for WebGPU
     export_weights(model, str(output_dir))
 
-    # Loss plot
     plt.figure(figsize=(10, 4))
     plt.plot(losses)
     plt.xlabel("Step")
@@ -420,8 +474,7 @@ def train(args):
     plt.savefig(str(output_dir / "loss.png"), dpi=100)
     plt.close()
 
-    # Final visualization
-    save_visualization(x, target, args.steps, str(vis_dir))
+    save_visualization(x, target, total_steps, str(vis_dir))
 
     print(f"Outputs saved to {output_dir}/")
 
@@ -453,4 +506,6 @@ if __name__ == "__main__":
             char_name = Path(args.target).stem
         args.output_dir = f"output/{char_name}"
 
-    train(args)
+    config = {"target": args.target, "output_dir": args.output_dir, "resume": args.resume,
+              "char": args.char, "steps": args.steps}
+    train(config)

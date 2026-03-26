@@ -1,0 +1,29 @@
+# NCA Batch Training Config
+#
+# All parameters are optional — defaults match the paper exactly.
+# Images are trained sequentially, each getting its own output/<name>/ directory.
+
+params:
+  steps: 8000
+  # channel_n: 16
+  # hidden_n: 128
+  # fire_rate: 0.5
+  # pool_size: 1024
+  # batch_size: 8
+  # damage_n: 3
+  # lr_initial: 0.002
+  # lr_decay_step: 2000
+  # lr_decay_factor: 0.1
+  # min_nca_steps: 64
+  # max_nca_steps: 96
+
+# Number of parallel worker processes (2 is optimal for M1 Max — Apple GPU has 2 HW concurrency slots)
+parallel: 2
+
+output_dir: output
+
+images:
+  - images/B.png
+  - images/C.png
+  - images/D.png
+  - images/E.png

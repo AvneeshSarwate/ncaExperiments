@@ -8,5 +8,16 @@ dependencies = [
     "matplotlib>=3.10.8",
     "numpy>=2.4.3",
     "pillow>=12.1.1",
+    "pyyaml>=6.0.3",
     "torch>=2.11.0",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
 ]

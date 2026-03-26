@@ -34,6 +34,38 @@ uv run python train.py --target images/A.png --resume output/A/checkpoint_004000
 
 Full training (8000 steps) takes ~15-20 minutes per character on M1 Max.
 
+## Batch training
+
+Train multiple characters from a YAML config:
+
+```bash
+# Train all characters listed in the config:
+uv run python batch_train.py train_config.yaml
+
+# Train only specific characters:
+uv run python batch_train.py train_config.yaml --only B D E
+
+# Preview what would run:
+uv run python batch_train.py train_config.yaml --dry-run
+```
+
+The config file specifies global parameters and a list of image files:
+
+```yaml
+params:
+  steps: 8000
+  # all other params are optional and default to the paper's values
+
+output_dir: output
+
+images:
+  - images/A.png
+  - images/B.png
+  - images/C.png
+```
+
+Characters are trained sequentially. Each image outputs to `output/<name>/` with the same structure as single training. See `train_config.yaml` for the full list of configurable parameters.
+
 ## Monitoring results
 
 Training progress is printed to the terminal every 100 steps. Outputs are saved to the output directory:

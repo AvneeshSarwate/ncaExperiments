@@ -9,6 +9,11 @@ wheels/
 # Virtual environments
 .venv
 
-output/*
+# Output directories: ignore everything except exported weights
+output/*/vis/
+output/*/checkpoint_*.pt
+output/*/loss.png
+output/*/analysis.png
+output/*/target_*.png
 
 *.DS_Store*
