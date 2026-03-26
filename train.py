@@ -387,6 +387,7 @@ def train(config: dict):
     model.train()
     total_steps = p["steps"]
 
+    prev_ckpt_path = None
     for step in range(start_step, total_steps):
         batch = pool.sample(p["batch_size"])
         x0 = batch.x.copy()
@@ -439,6 +440,9 @@ def train(config: dict):
             save_visualization(x, target, step, str(vis_dir))
 
         if step > 0 and step % 2000 == 0:
+            if prev_ckpt_path and os.path.exists(prev_ckpt_path):
+                os.remove(prev_ckpt_path)
+                prev_ckpt_path = None
             ckpt_path = str(output_dir / f"checkpoint_{step:06d}.pt")
             torch.save(
                 {
@@ -451,9 +455,13 @@ def train(config: dict):
                 },
                 ckpt_path,
             )
+            prev_ckpt_path = ckpt_path
             print(f"  Saved checkpoint: {ckpt_path}")
 
     # --- Final outputs ---
+    if prev_ckpt_path and os.path.exists(prev_ckpt_path):
+        os.remove(prev_ckpt_path)
+
     total_time = time.time() - t0
     print(f"\nTraining complete. {total_steps} steps in {total_time:.0f}s")
 
