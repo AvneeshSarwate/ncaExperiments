@@ -20,3 +20,5 @@ output/*/target_*.png
 
 *.build*
 *step_*.bin
+
+pytorch-mps-ref*

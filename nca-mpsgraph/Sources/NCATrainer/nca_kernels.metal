@@ -1,4 +1,5 @@
 #include <metal_stdlib>
+#include <metal_simdgroup>
 using namespace metal;
 
 // NCA-specific Metal compute kernels for 72x72 grid, 16 channels, batch 8.
@@ -12,6 +13,7 @@ constant int HW = H * W;      // 5184
 constant int PERC = 48;
 constant int HIDDEN = 128;
 constant uint REDUCE_THREADS = 256;
+constant uint WEIGHT_GRAD_THREADS = 64;
 
 // Sobel/identity perception kernels (hardcoded, divided by 8)
 constant float sobel_x[9] = {-0.125f, 0.0f, 0.125f, -0.25f, 0.0f, 0.25f, -0.125f, 0.0f, 0.125f};
@@ -100,6 +102,51 @@ kernel void perceive_x3(
     output[outBase + 2 * HW] = sy;
 }
 
+// Perception fused per input channel: writes channel-major and [B, HW, PERC] layouts.
+kernel void perceive_x3_dual(
+    device const float* input         [[buffer(0)]],
+    device float* output              [[buffer(1)]],
+    device float* output_hw_major     [[buffer(2)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    int x = gid.x;
+    int y = gid.y;
+    int bc = gid.z;
+    if (x >= W || y >= H || bc >= B * C) return;
+
+    int b = bc / C;
+    int inC = bc % C;
+    int spatialIdx = ((b * C + inC) * H + y) * W + x;
+
+    float identity = input[spatialIdx];
+    float sx = 0.0f;
+    float sy = 0.0f;
+
+    for (int ky = -1; ky <= 1; ky++) {
+        for (int kx = -1; kx <= 1; kx++) {
+            int syIdx = y + ky;
+            int sxIdx = x + kx;
+            float val = 0.0f;
+            if (syIdx >= 0 && syIdx < H && sxIdx >= 0 && sxIdx < W) {
+                val = input[((b * C + inC) * H + syIdx) * W + sxIdx];
+            }
+            int k = (ky + 1) * 3 + (kx + 1);
+            sx += val * sobel_x[k];
+            sy += val * sobel_y[k];
+        }
+    }
+
+    int outBase = ((b * PERC + inC * 3) * H + y) * W + x;
+    output[outBase + 0 * HW] = identity;
+    output[outBase + 1 * HW] = sx;
+    output[outBase + 2 * HW] = sy;
+
+    int hwMajorBase = (b * HW + y * W + x) * PERC + inC * 3;
+    output_hw_major[hwMajorBase + 0] = identity;
+    output_hw_major[hwMajorBase + 1] = sx;
+    output_hw_major[hwMajorBase + 2] = sy;
+}
+
 // Bias + ReLU: output = max(0, input + bias)
 // Input: [B, 128, 72, 72], Bias: [128] → Output: [B, 128, 72, 72]
 kernel void bias_relu(
@@ -117,6 +164,29 @@ kernel void bias_relu(
     int idx = (bc * H + y) * W + x;
     float val = input[idx] + bias[c];
     output[idx] = val > 0.0f ? val : 0.0f;
+}
+
+// Bias + ReLU that also writes [B, HW, HIDDEN] for GEMM-like weight gradients.
+kernel void bias_relu_dual(
+    device const float* input          [[buffer(0)]],
+    device const float* bias           [[buffer(1)]],
+    device float* output               [[buffer(2)]],
+    device float* output_hw_major      [[buffer(3)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    int x = gid.x;
+    int y = gid.y;
+    int bc = gid.z;
+    if (x >= W || y >= H || bc >= B * HIDDEN) return;
+
+    int b = bc / HIDDEN;
+    int c = bc % HIDDEN;
+    int spatial = y * W + x;
+    int idx = (bc * H + y) * W + x;
+    float val = input[idx] + bias[c];
+    float relu = val > 0.0f ? val : 0.0f;
+    output[idx] = relu;
+    output_hw_major[(b * HW + spatial) * HIDDEN + c] = relu;
 }
 
 // Max pool 3x3, stride 1, same padding, single channel
@@ -693,56 +763,215 @@ kernel void fc2_data_grad_relu_tiled(
     dInput[outIdx] = hidden[outIdx] > 0.0f ? sum : 0.0f;
 }
 
-// Model-specialized tiled weight grad for fc1: dFC1W from dFC1Raw and perc.
+// Pack [B, channels, HW] into [B, HW, channels] for coalesced matmul reads.
+kernel void pack_channels_hw_major(
+    device const float* input [[buffer(0)]],
+    device float* output      [[buffer(1)]],
+    constant int& channels    [[buffer(2)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    int n = int(gid.x);
+    int c = int(gid.y);
+    int b = int(gid.z);
+    if (b >= B || c >= channels || n >= HW) return;
+
+    output[(b * HW + n) * channels + c] = input[(b * channels + c) * HW + n];
+}
+
+// Model-specialized row-block reduction for fc1 weight grad.
 kernel void fc1_weight_grad_tiled(
     device const float* dOutput [[buffer(0)]],   // [B, HIDDEN, HW]
     device const float* input   [[buffer(1)]],   // [B, PERC, HW]
     device float* dWeight       [[buffer(2)]],   // [HIDDEN, PERC]
     uint3 tgid [[threadgroup_position_in_grid]],
-    uint3 tid [[thread_position_in_threadgroup]]
+    uint tid [[thread_index_in_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]]
 ) {
-    int ci = int(tgid.x) * 8 + int(tid.x);
-    int co = int(tgid.y) * 8 + int(tid.y);
-    if (ci >= PERC || co >= HIDDEN) return;
+    constexpr int FC1_BLOCK_CI = 16;
+    int ciBase = int(tgid.x) * FC1_BLOCK_CI;
+    int co = int(tgid.y);
+    if (co >= HIDDEN) return;
 
-    float sum = 0.0f;
+    threadgroup float4 partials0[2];
+    threadgroup float4 partials1[2];
+    threadgroup float4 partials2[2];
+    threadgroup float4 partials3[2];
+    float4 acc0 = float4(0.0f);
+    float4 acc1 = float4(0.0f);
+    float4 acc2 = float4(0.0f);
+    float4 acc3 = float4(0.0f);
     for (int b = 0; b < B; ++b) {
         int outBase = (b * HIDDEN + co) * HW;
-        int inBase = (b * PERC + ci) * HW;
-        for (int n = 0; n < HW; n += 4) {
-            const device float4* out4 = reinterpret_cast<const device float4*>(dOutput + outBase + n);
-            const device float4* in4 = reinterpret_cast<const device float4*>(input + inBase + n);
-            sum += dot(*out4, *in4);
+        for (uint n = tid * 4; n < uint(HW); n += WEIGHT_GRAD_THREADS * 4) {
+            float4 out4 = *reinterpret_cast<const device float4*>(dOutput + outBase + int(n));
+            const device float4* in0 = reinterpret_cast<const device float4*>(input + ((b * PERC + ciBase + 0) * HW + int(n)));
+            const device float4* in1 = reinterpret_cast<const device float4*>(input + ((b * PERC + ciBase + 1) * HW + int(n)));
+            const device float4* in2 = reinterpret_cast<const device float4*>(input + ((b * PERC + ciBase + 2) * HW + int(n)));
+            const device float4* in3 = reinterpret_cast<const device float4*>(input + ((b * PERC + ciBase + 3) * HW + int(n)));
+            const device float4* in4 = reinterpret_cast<const device float4*>(input + ((b * PERC + ciBase + 4) * HW + int(n)));
+            const device float4* in5 = reinterpret_cast<const device float4*>(input + ((b * PERC + ciBase + 5) * HW + int(n)));
+            const device float4* in6 = reinterpret_cast<const device float4*>(input + ((b * PERC + ciBase + 6) * HW + int(n)));
+            const device float4* in7 = reinterpret_cast<const device float4*>(input + ((b * PERC + ciBase + 7) * HW + int(n)));
+            const device float4* in8 = reinterpret_cast<const device float4*>(input + ((b * PERC + ciBase + 8) * HW + int(n)));
+            const device float4* in9 = reinterpret_cast<const device float4*>(input + ((b * PERC + ciBase + 9) * HW + int(n)));
+            const device float4* in10 = reinterpret_cast<const device float4*>(input + ((b * PERC + ciBase + 10) * HW + int(n)));
+            const device float4* in11 = reinterpret_cast<const device float4*>(input + ((b * PERC + ciBase + 11) * HW + int(n)));
+            const device float4* in12 = reinterpret_cast<const device float4*>(input + ((b * PERC + ciBase + 12) * HW + int(n)));
+            const device float4* in13 = reinterpret_cast<const device float4*>(input + ((b * PERC + ciBase + 13) * HW + int(n)));
+            const device float4* in14 = reinterpret_cast<const device float4*>(input + ((b * PERC + ciBase + 14) * HW + int(n)));
+            const device float4* in15 = reinterpret_cast<const device float4*>(input + ((b * PERC + ciBase + 15) * HW + int(n)));
+            acc0 += float4(dot(out4, *in0), dot(out4, *in1), dot(out4, *in2), dot(out4, *in3));
+            acc1 += float4(dot(out4, *in4), dot(out4, *in5), dot(out4, *in6), dot(out4, *in7));
+            acc2 += float4(dot(out4, *in8), dot(out4, *in9), dot(out4, *in10), dot(out4, *in11));
+            acc3 += float4(dot(out4, *in12), dot(out4, *in13), dot(out4, *in14), dot(out4, *in15));
         }
     }
 
-    dWeight[co * PERC + ci] = sum;
+    acc0.x = simd_sum(acc0.x);
+    acc0.y = simd_sum(acc0.y);
+    acc0.z = simd_sum(acc0.z);
+    acc0.w = simd_sum(acc0.w);
+    acc1.x = simd_sum(acc1.x);
+    acc1.y = simd_sum(acc1.y);
+    acc1.z = simd_sum(acc1.z);
+    acc1.w = simd_sum(acc1.w);
+    acc2.x = simd_sum(acc2.x);
+    acc2.y = simd_sum(acc2.y);
+    acc2.z = simd_sum(acc2.z);
+    acc2.w = simd_sum(acc2.w);
+    acc3.x = simd_sum(acc3.x);
+    acc3.y = simd_sum(acc3.y);
+    acc3.z = simd_sum(acc3.z);
+    acc3.w = simd_sum(acc3.w);
+
+    if (simd_lane_id == 0) {
+        partials0[simd_group_id] = acc0;
+        partials1[simd_group_id] = acc1;
+        partials2[simd_group_id] = acc2;
+        partials3[simd_group_id] = acc3;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float4 total0 = partials0[0] + partials0[1];
+        float4 total1 = partials1[0] + partials1[1];
+        float4 total2 = partials2[0] + partials2[1];
+        float4 total3 = partials3[0] + partials3[1];
+        dWeight[co * PERC + ciBase + 0] = total0.x;
+        dWeight[co * PERC + ciBase + 1] = total0.y;
+        dWeight[co * PERC + ciBase + 2] = total0.z;
+        dWeight[co * PERC + ciBase + 3] = total0.w;
+        dWeight[co * PERC + ciBase + 4] = total1.x;
+        dWeight[co * PERC + ciBase + 5] = total1.y;
+        dWeight[co * PERC + ciBase + 6] = total1.z;
+        dWeight[co * PERC + ciBase + 7] = total1.w;
+        dWeight[co * PERC + ciBase + 8] = total2.x;
+        dWeight[co * PERC + ciBase + 9] = total2.y;
+        dWeight[co * PERC + ciBase + 10] = total2.z;
+        dWeight[co * PERC + ciBase + 11] = total2.w;
+        dWeight[co * PERC + ciBase + 12] = total3.x;
+        dWeight[co * PERC + ciBase + 13] = total3.y;
+        dWeight[co * PERC + ciBase + 14] = total3.z;
+        dWeight[co * PERC + ciBase + 15] = total3.w;
+    }
 }
 
-// Model-specialized tiled weight grad for fc2: dFC2W from dResidual and hidden.
+// Model-specialized row-block reduction for fc2 weight grad.
 kernel void fc2_weight_grad_tiled(
     device const float* dOutput [[buffer(0)]],   // [B, C, HW]
     device const float* input   [[buffer(1)]],   // [B, HIDDEN, HW]
     device float* dWeight       [[buffer(2)]],   // [C, HIDDEN]
     uint3 tgid [[threadgroup_position_in_grid]],
-    uint3 tid [[thread_position_in_threadgroup]]
+    uint tid [[thread_index_in_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]]
 ) {
-    int ci = int(tgid.x) * 8 + int(tid.x);
-    int co = int(tgid.y) * 8 + int(tid.y);
-    if (ci >= HIDDEN || co >= C) return;
+    constexpr int FC2_BLOCK_CI = 16;
+    int ciBase = int(tgid.x) * FC2_BLOCK_CI;
+    int co = int(tgid.y);
+    if (co >= C) return;
 
-    float sum = 0.0f;
+    threadgroup float4 partials0[2];
+    threadgroup float4 partials1[2];
+    threadgroup float4 partials2[2];
+    threadgroup float4 partials3[2];
+    float4 acc0 = float4(0.0f);
+    float4 acc1 = float4(0.0f);
+    float4 acc2 = float4(0.0f);
+    float4 acc3 = float4(0.0f);
     for (int b = 0; b < B; ++b) {
         int outBase = (b * C + co) * HW;
-        int inBase = (b * HIDDEN + ci) * HW;
-        for (int n = 0; n < HW; n += 4) {
-            const device float4* out4 = reinterpret_cast<const device float4*>(dOutput + outBase + n);
-            const device float4* in4 = reinterpret_cast<const device float4*>(input + inBase + n);
-            sum += dot(*out4, *in4);
+        for (uint n = tid * 4; n < uint(HW); n += WEIGHT_GRAD_THREADS * 4) {
+            float4 out4 = *reinterpret_cast<const device float4*>(dOutput + outBase + int(n));
+            const device float4* in0 = reinterpret_cast<const device float4*>(input + ((b * HIDDEN + ciBase + 0) * HW + int(n)));
+            const device float4* in1 = reinterpret_cast<const device float4*>(input + ((b * HIDDEN + ciBase + 1) * HW + int(n)));
+            const device float4* in2 = reinterpret_cast<const device float4*>(input + ((b * HIDDEN + ciBase + 2) * HW + int(n)));
+            const device float4* in3 = reinterpret_cast<const device float4*>(input + ((b * HIDDEN + ciBase + 3) * HW + int(n)));
+            const device float4* in4 = reinterpret_cast<const device float4*>(input + ((b * HIDDEN + ciBase + 4) * HW + int(n)));
+            const device float4* in5 = reinterpret_cast<const device float4*>(input + ((b * HIDDEN + ciBase + 5) * HW + int(n)));
+            const device float4* in6 = reinterpret_cast<const device float4*>(input + ((b * HIDDEN + ciBase + 6) * HW + int(n)));
+            const device float4* in7 = reinterpret_cast<const device float4*>(input + ((b * HIDDEN + ciBase + 7) * HW + int(n)));
+            const device float4* in8 = reinterpret_cast<const device float4*>(input + ((b * HIDDEN + ciBase + 8) * HW + int(n)));
+            const device float4* in9 = reinterpret_cast<const device float4*>(input + ((b * HIDDEN + ciBase + 9) * HW + int(n)));
+            const device float4* in10 = reinterpret_cast<const device float4*>(input + ((b * HIDDEN + ciBase + 10) * HW + int(n)));
+            const device float4* in11 = reinterpret_cast<const device float4*>(input + ((b * HIDDEN + ciBase + 11) * HW + int(n)));
+            const device float4* in12 = reinterpret_cast<const device float4*>(input + ((b * HIDDEN + ciBase + 12) * HW + int(n)));
+            const device float4* in13 = reinterpret_cast<const device float4*>(input + ((b * HIDDEN + ciBase + 13) * HW + int(n)));
+            const device float4* in14 = reinterpret_cast<const device float4*>(input + ((b * HIDDEN + ciBase + 14) * HW + int(n)));
+            const device float4* in15 = reinterpret_cast<const device float4*>(input + ((b * HIDDEN + ciBase + 15) * HW + int(n)));
+            acc0 += float4(dot(out4, *in0), dot(out4, *in1), dot(out4, *in2), dot(out4, *in3));
+            acc1 += float4(dot(out4, *in4), dot(out4, *in5), dot(out4, *in6), dot(out4, *in7));
+            acc2 += float4(dot(out4, *in8), dot(out4, *in9), dot(out4, *in10), dot(out4, *in11));
+            acc3 += float4(dot(out4, *in12), dot(out4, *in13), dot(out4, *in14), dot(out4, *in15));
         }
     }
 
-    dWeight[co * HIDDEN + ci] = sum;
+    acc0.x = simd_sum(acc0.x);
+    acc0.y = simd_sum(acc0.y);
+    acc0.z = simd_sum(acc0.z);
+    acc0.w = simd_sum(acc0.w);
+    acc1.x = simd_sum(acc1.x);
+    acc1.y = simd_sum(acc1.y);
+    acc1.z = simd_sum(acc1.z);
+    acc1.w = simd_sum(acc1.w);
+    acc2.x = simd_sum(acc2.x);
+    acc2.y = simd_sum(acc2.y);
+    acc2.z = simd_sum(acc2.z);
+    acc2.w = simd_sum(acc2.w);
+    acc3.x = simd_sum(acc3.x);
+    acc3.y = simd_sum(acc3.y);
+    acc3.z = simd_sum(acc3.z);
+    acc3.w = simd_sum(acc3.w);
+
+    if (simd_lane_id == 0) {
+        partials0[simd_group_id] = acc0;
+        partials1[simd_group_id] = acc1;
+        partials2[simd_group_id] = acc2;
+        partials3[simd_group_id] = acc3;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float4 total0 = partials0[0] + partials0[1];
+        float4 total1 = partials1[0] + partials1[1];
+        float4 total2 = partials2[0] + partials2[1];
+        float4 total3 = partials3[0] + partials3[1];
+        dWeight[co * HIDDEN + ciBase + 0] = total0.x;
+        dWeight[co * HIDDEN + ciBase + 1] = total0.y;
+        dWeight[co * HIDDEN + ciBase + 2] = total0.z;
+        dWeight[co * HIDDEN + ciBase + 3] = total0.w;
+        dWeight[co * HIDDEN + ciBase + 4] = total1.x;
+        dWeight[co * HIDDEN + ciBase + 5] = total1.y;
+        dWeight[co * HIDDEN + ciBase + 6] = total1.z;
+        dWeight[co * HIDDEN + ciBase + 7] = total1.w;
+        dWeight[co * HIDDEN + ciBase + 8] = total2.x;
+        dWeight[co * HIDDEN + ciBase + 9] = total2.y;
+        dWeight[co * HIDDEN + ciBase + 10] = total2.z;
+        dWeight[co * HIDDEN + ciBase + 11] = total2.w;
+        dWeight[co * HIDDEN + ciBase + 12] = total3.x;
+        dWeight[co * HIDDEN + ciBase + 13] = total3.y;
+        dWeight[co * HIDDEN + ciBase + 14] = total3.z;
+        dWeight[co * HIDDEN + ciBase + 15] = total3.w;
+    }
 }
 
 // 1x1 conv weight gradient: dWeight[co,ci] = sum_b,y,x(dOutput[b,co,y,x] * input[b,ci,y,x])

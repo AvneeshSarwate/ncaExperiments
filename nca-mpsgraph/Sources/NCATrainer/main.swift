@@ -46,7 +46,9 @@ struct RolloutScratch {
 
 struct FastTrainScratch {
     let perc: MTLBuffer
+    let percHWMajor: MTLBuffer
     let hidden: MTLBuffer
+    let hiddenHWMajor: MTLBuffer
     let delta: MTLBuffer
     let preMask: MTLBuffer
     let postMask: MTLBuffer
@@ -96,6 +98,7 @@ class NCAMetal {
     let conv1x1DataGradReluT4PSO: MTLComputePipelineState
     let fc1DataGradTiledPSO: MTLComputePipelineState
     let fc2DataGradReluTiledPSO: MTLComputePipelineState
+    let packChannelsHWMajorPSO: MTLComputePipelineState
     let fc1WeightGradTiledPSO: MTLComputePipelineState
     let fc2WeightGradTiledPSO: MTLComputePipelineState
     let conv1x1WeightGradPSO: MTLComputePipelineState
@@ -142,6 +145,7 @@ class NCAMetal {
         conv1x1DataGradPSO = pso("conv1x1_data_grad")
         fc1DataGradTiledPSO = pso("fc1_data_grad_tiled")
         fc2DataGradReluTiledPSO = pso("fc2_data_grad_relu_tiled")
+        packChannelsHWMajorPSO = pso("pack_channels_hw_major")
         fc1WeightGradTiledPSO = pso("fc1_weight_grad_tiled")
         fc2WeightGradTiledPSO = pso("fc2_weight_grad_tiled")
         conv1x1WeightGradPSO = pso("conv1x1_weight_grad")
@@ -169,6 +173,10 @@ class NCAMetal {
 
     func makeBuffer(_ data: [Float]) -> MTLBuffer {
         device.makeBuffer(bytes: data, length: data.count * 4, options: .storageModeShared)!
+    }
+
+    func makePrivateBuffer(_ data: [Float]) -> MTLBuffer {
+        makePrivateCopy(of: makeBuffer(data))
     }
 
     func makeBuffer(size: Int) -> MTLBuffer {
@@ -330,6 +338,19 @@ class NCAMetal {
         )
     }
 
+    func dispatchPackChannelsHWMajor(_ enc: MTLComputeCommandEncoder, input: MTLBuffer,
+                                     output: MTLBuffer, channels: Int) {
+        enc.setComputePipelineState(packChannelsHWMajorPSO)
+        enc.setBuffer(input, offset: 0, index: 0)
+        enc.setBuffer(output, offset: 0, index: 1)
+        var channelCount = Int32(channels)
+        enc.setBytes(&channelCount, length: 4, index: 2)
+        enc.dispatchThreads(
+            MTLSize(width: HW, height: channels, depth: BATCH),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 8, depth: 1)
+        )
+    }
+
     func dispatchFC1WeightGradTiled(_ enc: MTLComputeCommandEncoder, dOutput: MTLBuffer,
                                     input: MTLBuffer, dWeight: MTLBuffer) {
         enc.setComputePipelineState(fc1WeightGradTiledPSO)
@@ -338,10 +359,10 @@ class NCAMetal {
         enc.setBuffer(dWeight, offset: 0, index: 2)
         dispatchThreadgroups(
             enc,
-            width: (PERC + 7) / 8,
-            height: (HIDDEN + 7) / 8,
+            width: PERC / 16,
+            height: HIDDEN,
             depth: 1,
-            threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1)
+            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1)
         )
     }
 
@@ -353,10 +374,10 @@ class NCAMetal {
         enc.setBuffer(dWeight, offset: 0, index: 2)
         dispatchThreadgroups(
             enc,
-            width: (HIDDEN + 7) / 8,
-            height: (C + 7) / 8,
+            width: HIDDEN / 16,
+            height: C,
             depth: 1,
-            threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1)
+            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1)
         )
     }
 
@@ -672,7 +693,9 @@ class NCAMetal {
     func makeFastTrainScratch(options: MTLResourceOptions = .storageModeShared) -> FastTrainScratch {
         FastTrainScratch(
             perc: makeBuffer(size: BATCH * PERC * HW, options: options),
+            percHWMajor: makeBuffer(size: BATCH * HW * PERC, options: options),
             hidden: makeBuffer(size: BATCH * HIDDEN * HW, options: options),
+            hiddenHWMajor: makeBuffer(size: BATCH * HW * HIDDEN, options: options),
             delta: makeBuffer(size: BATCH * C * HW, options: options),
             preMask: makeBuffer(size: BATCH * HW, options: options),
             postMask: makeBuffer(size: BATCH * HW, options: options),
@@ -911,11 +934,11 @@ func loadWeights(_ metal: NCAMetal) -> LoadedWeights {
         fc2WData: fc2WData,
         fc1WTData: fc1WTData,
         fc2WTData: fc2WTData,
-        fc1W: metal.makeBuffer(fc1WData),
-        fc1B: metal.makeBuffer(fc1BData),
-        fc2W: metal.makeBuffer(fc2WData),
-        fc1WT: metal.makeBuffer(fc1WTData),
-        fc2WT: metal.makeBuffer(fc2WTData)
+        fc1W: metal.makePrivateBuffer(fc1WData),
+        fc1B: metal.makePrivateBuffer(fc1BData),
+        fc2W: metal.makePrivateBuffer(fc2WData),
+        fc1WT: metal.makePrivateBuffer(fc1WTData),
+        fc2WT: metal.makePrivateBuffer(fc2WTData)
     )
 }
 
