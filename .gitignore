@@ -19,3 +19,4 @@ output/*/target_*.png
 *.DS_Store*
 
 *.build*
+*step_*.bin

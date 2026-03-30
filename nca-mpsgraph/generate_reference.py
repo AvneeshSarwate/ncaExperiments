@@ -1,5 +1,6 @@
-"""Generate NCHW reference outputs from PyTorch for validating the MPSGraph implementation."""
+"""Generate NCHW rollout references from PyTorch for validating the Metal implementation."""
 
+import argparse
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -8,11 +9,8 @@ import torch
 from nca_model import NCAModel
 from train import load_target, find_seed_position, CHANNEL_N, GRID_SIZE, TARGET_PADDING
 
-CHECKPOINT = "../output/A/checkpoint_final.pt"
-WEIGHTS_BIN = "../output/A/weights.bin"
 TARGET = "../images/A.png"
 OUTPUT_DIR = "reference"
-N_STEPS = 10
 
 
 def save_nchw(x, path):
@@ -21,11 +19,15 @@ def save_nchw(x, path):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--steps", type=int, default=10)
+    args = parser.parse_args()
+
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     device = torch.device("cpu")
 
     model = NCAModel(CHANNEL_N, 128, fire_rate=1.0).to(device)
-    ckpt = torch.load(CHECKPOINT, map_location=device, weights_only=False)
+    ckpt = torch.load("../output/A/checkpoint_final.pt", map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"])
     model.eval()
 
@@ -42,7 +44,7 @@ def main():
 
     x = seed.clone()
     with torch.no_grad():
-        for i in range(1, N_STEPS + 1):
+        for i in range(1, args.steps + 1):
             x = model(x, fire_rate=1.0)
             save_nchw(x, os.path.join(OUTPUT_DIR, f"step_{i:03d}.bin"))
             alpha = x[0, 3].numpy()
@@ -53,7 +55,7 @@ def main():
     with open(os.path.join(OUTPUT_DIR, "seed_pos.txt"), "w") as f:
         f.write(f"{seed_y} {seed_x}\n")
 
-    print(f"\nSaved {N_STEPS + 1} NCHW reference states to {OUTPUT_DIR}/")
+    print(f"\nSaved {args.steps + 1} NCHW reference states to {OUTPUT_DIR}/")
 
 
 if __name__ == "__main__":

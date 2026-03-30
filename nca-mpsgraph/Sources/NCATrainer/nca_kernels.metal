@@ -9,9 +9,9 @@ constant int C = 16;
 constant int H = 72;
 constant int W = 72;
 constant int HW = H * W;      // 5184
-constant int CHW = C * HW;    // 82944
 constant int PERC = 48;
 constant int HIDDEN = 128;
+constant uint REDUCE_THREADS = 256;
 
 // Sobel/identity perception kernels (hardcoded, divided by 8)
 constant float sobel_x[9] = {-0.125f, 0.0f, 0.125f, -0.25f, 0.0f, 0.25f, -0.125f, 0.0f, 0.125f};
@@ -59,6 +59,45 @@ kernel void perceive(
     }
 
     output[((b * PERC + outC) * H + y) * W + x] = result;
+}
+
+// Perception fused per input channel: writes identity, sobel_x, and sobel_y together.
+kernel void perceive_x3(
+    device const float* input  [[buffer(0)]],
+    device float* output       [[buffer(1)]],
+    uint3 gid [[thread_position_in_grid]]  // (x, y, b*16+inC)
+) {
+    int x = gid.x;
+    int y = gid.y;
+    int bc = gid.z;  // b * C + inC
+    if (x >= W || y >= H || bc >= B * C) return;
+
+    int b = bc / C;
+    int inC = bc % C;
+    int spatialIdx = ((b * C + inC) * H + y) * W + x;
+
+    float identity = input[spatialIdx];
+    float sx = 0.0f;
+    float sy = 0.0f;
+
+    for (int ky = -1; ky <= 1; ky++) {
+        for (int kx = -1; kx <= 1; kx++) {
+            int syIdx = y + ky;
+            int sxIdx = x + kx;
+            float val = 0.0f;
+            if (syIdx >= 0 && syIdx < H && sxIdx >= 0 && sxIdx < W) {
+                val = input[((b * C + inC) * H + syIdx) * W + sxIdx];
+            }
+            int k = (ky + 1) * 3 + (kx + 1);
+            sx += val * sobel_x[k];
+            sy += val * sobel_y[k];
+        }
+    }
+
+    int outBase = ((b * PERC + inC * 3) * H + y) * W + x;
+    output[outBase + 0 * HW] = identity;
+    output[outBase + 1 * HW] = sx;
+    output[outBase + 2 * HW] = sy;
 }
 
 // Bias + ReLU: output = max(0, input + bias)
@@ -116,6 +155,17 @@ kernel void threshold_mask(
     output[gid] = input[gid] > 0.1f ? 1.0f : 0.0f;
 }
 
+// Element-wise multiply for single-channel [B, 1, H, W] masks.
+kernel void mask_multiply(
+    device const float* lhs  [[buffer(0)]],
+    device const float* rhs  [[buffer(1)]],
+    device float* output     [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= uint(B * HW)) return;
+    output[gid] = lhs[gid] * rhs[gid];
+}
+
 // Masked residual + life mask: output = (state + delta * fireMask) * lifeMask
 // state: [B,16,H,W], delta: [B,16,H,W], fireMask: [B,1,H,W], lifeMask: [B,1,H,W]
 // fireMask and lifeMask broadcast over channels
@@ -141,6 +191,22 @@ kernel void masked_residual(
     output[idx] = (state[idx] + delta[idx] * fm) * lm;
 }
 
+// Residual add specialized for fireRate=1 and unit life mask.
+kernel void residual_add(
+    device const float* state  [[buffer(0)]],
+    device const float* delta  [[buffer(1)]],
+    device float* output       [[buffer(2)]],
+    uint3 gid [[thread_position_in_grid]]  // (x, y, b*C+c)
+) {
+    int x = gid.x;
+    int y = gid.y;
+    int bc = gid.z;
+    if (x >= W || y >= H || bc >= B * C) return;
+
+    int idx = (bc * H + y) * W + x;
+    output[idx] = state[idx] + delta[idx];
+}
+
 // Slice alpha channel: output[b,0,y,x] = input[b,3,y,x]
 kernel void slice_alpha(
     device const float* input  [[buffer(0)]],
@@ -152,6 +218,93 @@ kernel void slice_alpha(
     int b = gid.z;
     if (x >= W || y >= H || b >= B) return;
     output[(b * H + y) * W + x] = input[((b * C + 3) * H + y) * W + x];
+}
+
+// Apply a [B,1,H,W] life mask to a [B,C,H,W] tensor.
+kernel void apply_life_mask(
+    device const float* input    [[buffer(0)]],
+    device const float* lifeMask [[buffer(1)]],
+    device float* output         [[buffer(2)]],
+    uint3 gid [[thread_position_in_grid]]  // (x, y, b*C+c)
+) {
+    int x = gid.x;
+    int y = gid.y;
+    int bc = gid.z;
+    if (x >= W || y >= H || bc >= B * C) return;
+
+    int b = bc / C;
+    int idx = (bc * H + y) * W + x;
+    int maskIdx = (b * H + y) * W + x;
+    output[idx] = input[idx] * lifeMask[maskIdx];
+}
+
+// Fused alive-mask computation directly from the alpha channel of a [B,C,H,W] state tensor.
+kernel void alive_mask_from_state(
+    device const float* input  [[buffer(0)]],
+    device float* output       [[buffer(1)]],
+    uint3 gid [[thread_position_in_grid]]  // (x, y, b)
+) {
+    int x = gid.x;
+    int y = gid.y;
+    int b = gid.z;
+    if (x >= W || y >= H || b >= B) return;
+
+    float maxVal = -1e30f;
+    for (int ky = -1; ky <= 1; ky++) {
+        for (int kx = -1; kx <= 1; kx++) {
+            int sy = y + ky;
+            int sx = x + kx;
+            if (sy >= 0 && sy < H && sx >= 0 && sx < W) {
+                float val = input[((b * C + 3) * H + sy) * W + sx];
+                maxVal = max(maxVal, val);
+            }
+        }
+    }
+    output[(b * H + y) * W + x] = maxVal > 0.1f ? 1.0f : 0.0f;
+}
+
+// Apply pre/post masks to a [B,C,H,W] tensor in one pass.
+kernel void apply_two_masks(
+    device const float* input    [[buffer(0)]],
+    device const float* preMask  [[buffer(1)]],
+    device const float* postMask [[buffer(2)]],
+    device float* output         [[buffer(3)]],
+    uint3 gid [[thread_position_in_grid]]  // (x, y, b*C+c)
+) {
+    int x = gid.x;
+    int y = gid.y;
+    int bc = gid.z;
+    if (x >= W || y >= H || bc >= B * C) return;
+
+    int b = bc / C;
+    int idx = (bc * H + y) * W + x;
+    int maskIdx = (b * H + y) * W + x;
+    output[idx] = input[idx] * preMask[maskIdx] * postMask[maskIdx];
+}
+
+// Apply pre/post masks and also persist the combined life mask for backward.
+kernel void apply_two_masks_store_life(
+    device const float* input    [[buffer(0)]],
+    device const float* preMask  [[buffer(1)]],
+    device const float* postMask [[buffer(2)]],
+    device float* output         [[buffer(3)]],
+    device float* lifeMask       [[buffer(4)]],
+    uint3 gid [[thread_position_in_grid]]  // (x, y, b*C+c)
+) {
+    int x = gid.x;
+    int y = gid.y;
+    int bc = gid.z;
+    if (x >= W || y >= H || bc >= B * C) return;
+
+    int b = bc / C;
+    int c = bc % C;
+    int idx = (bc * H + y) * W + x;
+    int maskIdx = (b * H + y) * W + x;
+    float lm = preMask[maskIdx] * postMask[maskIdx];
+    if (c == 0) {
+        lifeMask[maskIdx] = lm;
+    }
+    output[idx] = input[idx] * lm;
 }
 
 // ---- BACKWARD KERNELS ----
@@ -197,18 +350,34 @@ kernel void relu_backward(
 kernel void bias_grad(
     device const float* dFC1Raw [[buffer(0)]],
     device float* dBias         [[buffer(1)]],
-    uint gid [[thread_position_in_grid]]  // channel index
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
 ) {
+    uint gid = tgid.x;
     if (gid >= uint(HIDDEN)) return;
+
+    threadgroup float partials[REDUCE_THREADS];
     float sum = 0.0f;
-    for (int b = 0; b < B; b++) {
-        for (int y = 0; y < H; y++) {
-            for (int x = 0; x < W; x++) {
-                sum += dFC1Raw[((b * HIDDEN + int(gid)) * H + y) * W + x];
-            }
+    for (int b = 0; b < B; ++b) {
+        int base = (b * HIDDEN + int(gid)) * HW;
+        for (uint yx = tid * 4; yx < uint(HW); yx += REDUCE_THREADS * 4) {
+            const device float4* row4 = reinterpret_cast<const device float4*>(dFC1Raw + base + int(yx));
+            sum += dot(*row4, float4(1.0f));
         }
     }
-    dBias[gid] = sum;
+    partials[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = REDUCE_THREADS / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        dBias[gid] = partials[0];
+    }
 }
 
 // Backward of perceive: transpose depthwise conv with fixed kernels
@@ -291,6 +460,83 @@ kernel void conv1x1_forward(
     output[(b_idx * Cout + co) * HW + spatialIdx] = sum;
 }
 
+// 1x1 conv forward with transposed weights [Cin, Cout] and 4 output channels per thread.
+kernel void conv1x1_forward_x4(
+    device const float* input    [[buffer(0)]],
+    device const float* weight_t [[buffer(1)]],
+    device float* output         [[buffer(2)]],
+    constant int& Cin            [[buffer(3)]],
+    constant int& Cout           [[buffer(4)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    int x = gid.x;
+    int y = gid.y;
+    int bblock = gid.z;
+    if (x >= W || y >= H) return;
+
+    int coutBlocks = Cout / 4;
+    int b_idx = bblock / coutBlocks;
+    int block = bblock % coutBlocks;
+    if (b_idx >= B) return;
+
+    int coBase = block * 4;
+    int spatialIdx = y * W + x;
+    float4 sum = float4(0.0f);
+
+    for (int ci = 0; ci < Cin; ci++) {
+        float inVal = input[(b_idx * Cin + ci) * HW + spatialIdx];
+        const device float4* w4 = reinterpret_cast<const device float4*>(weight_t + ci * Cout + coBase);
+        sum += inVal * (*w4);
+    }
+
+    output[(b_idx * Cout + coBase + 0) * HW + spatialIdx] = sum.x;
+    output[(b_idx * Cout + coBase + 1) * HW + spatialIdx] = sum.y;
+    output[(b_idx * Cout + coBase + 2) * HW + spatialIdx] = sum.z;
+    output[(b_idx * Cout + coBase + 3) * HW + spatialIdx] = sum.w;
+}
+
+// 1x1 conv forward with transposed weights [Cin, Cout] and 8 output channels per thread.
+kernel void conv1x1_forward_x8(
+    device const float* input    [[buffer(0)]],
+    device const float* weight_t [[buffer(1)]],
+    device float* output         [[buffer(2)]],
+    constant int& Cin            [[buffer(3)]],
+    constant int& Cout           [[buffer(4)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    int x = gid.x;
+    int y = gid.y;
+    int bblock = gid.z;
+    if (x >= W || y >= H) return;
+
+    int coutBlocks = Cout / 8;
+    int b_idx = bblock / coutBlocks;
+    int block = bblock % coutBlocks;
+    if (b_idx >= B) return;
+
+    int coBase = block * 8;
+    int spatialIdx = y * W + x;
+    float4 sum0 = float4(0.0f);
+    float4 sum1 = float4(0.0f);
+
+    for (int ci = 0; ci < Cin; ci++) {
+        float inVal = input[(b_idx * Cin + ci) * HW + spatialIdx];
+        const device float4* w0 = reinterpret_cast<const device float4*>(weight_t + ci * Cout + coBase);
+        const device float4* w1 = reinterpret_cast<const device float4*>(weight_t + ci * Cout + coBase + 4);
+        sum0 += inVal * (*w0);
+        sum1 += inVal * (*w1);
+    }
+
+    output[(b_idx * Cout + coBase + 0) * HW + spatialIdx] = sum0.x;
+    output[(b_idx * Cout + coBase + 1) * HW + spatialIdx] = sum0.y;
+    output[(b_idx * Cout + coBase + 2) * HW + spatialIdx] = sum0.z;
+    output[(b_idx * Cout + coBase + 3) * HW + spatialIdx] = sum0.w;
+    output[(b_idx * Cout + coBase + 4) * HW + spatialIdx] = sum1.x;
+    output[(b_idx * Cout + coBase + 5) * HW + spatialIdx] = sum1.y;
+    output[(b_idx * Cout + coBase + 6) * HW + spatialIdx] = sum1.z;
+    output[(b_idx * Cout + coBase + 7) * HW + spatialIdx] = sum1.w;
+}
+
 // 1x1 conv data gradient: dInput[b,ci,y,x] = sum_co(dOutput[b,co,y,x] * weight[co,ci])
 kernel void conv1x1_data_grad(
     device const float* dOutput [[buffer(0)]],
@@ -316,6 +562,189 @@ kernel void conv1x1_data_grad(
     dInput[(b_idx * Cin + ci) * HW + spatialIdx] = sum;
 }
 
+// 1x1 conv data gradient with transposed weights [Cin, Cout] and float4 accumulation over Cout.
+kernel void conv1x1_data_grad_t4(
+    device const float* dOutput  [[buffer(0)]],
+    device const float* weight_t [[buffer(1)]],
+    device float* dInput         [[buffer(2)]],
+    constant int& Cin            [[buffer(3)]],
+    constant int& Cout           [[buffer(4)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    int x = gid.x;
+    int y = gid.y;
+    int bci = gid.z;
+    if (x >= W || y >= H) return;
+    int b_idx = bci / Cin;
+    int ci = bci % Cin;
+    if (b_idx >= B) return;
+
+    int spatialIdx = y * W + x;
+    float sum = 0.0f;
+    const device float* wRow = weight_t + ci * Cout;
+
+    for (int co = 0; co < Cout; co += 4) {
+        float4 dout4 = float4(
+            dOutput[(b_idx * Cout + co + 0) * HW + spatialIdx],
+            dOutput[(b_idx * Cout + co + 1) * HW + spatialIdx],
+            dOutput[(b_idx * Cout + co + 2) * HW + spatialIdx],
+            dOutput[(b_idx * Cout + co + 3) * HW + spatialIdx]
+        );
+        const device float4* w4 = reinterpret_cast<const device float4*>(wRow + co);
+        sum += dot(dout4, *w4);
+    }
+
+    dInput[(b_idx * Cin + ci) * HW + spatialIdx] = sum;
+}
+
+// 1x1 conv data gradient fused with ReLU backward.
+kernel void conv1x1_data_grad_relu_t4(
+    device const float* dOutput  [[buffer(0)]],
+    device const float* weight_t [[buffer(1)]],
+    device const float* hidden   [[buffer(2)]],
+    device float* dInput         [[buffer(3)]],
+    constant int& Cin            [[buffer(4)]],
+    constant int& Cout           [[buffer(5)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    int x = gid.x;
+    int y = gid.y;
+    int bci = gid.z;
+    if (x >= W || y >= H) return;
+    int b_idx = bci / Cin;
+    int ci = bci % Cin;
+    if (b_idx >= B) return;
+
+    int spatialIdx = y * W + x;
+    int outIdx = (b_idx * Cin + ci) * HW + spatialIdx;
+    float sum = 0.0f;
+    const device float* wRow = weight_t + ci * Cout;
+
+    for (int co = 0; co < Cout; co += 4) {
+        float4 dout4 = float4(
+            dOutput[(b_idx * Cout + co + 0) * HW + spatialIdx],
+            dOutput[(b_idx * Cout + co + 1) * HW + spatialIdx],
+            dOutput[(b_idx * Cout + co + 2) * HW + spatialIdx],
+            dOutput[(b_idx * Cout + co + 3) * HW + spatialIdx]
+        );
+        const device float4* w4 = reinterpret_cast<const device float4*>(wRow + co);
+        sum += dot(dout4, *w4);
+    }
+
+    dInput[outIdx] = hidden[outIdx] > 0.0f ? sum : 0.0f;
+}
+
+// Model-specialized tiled data grad for fc1: dPerc from dFC1Raw.
+kernel void fc1_data_grad_tiled(
+    device const float* dOutput  [[buffer(0)]],  // [B, HIDDEN, HW]
+    device const float* weight_t [[buffer(1)]],  // [PERC, HIDDEN]
+    device float* dInput         [[buffer(2)]],  // [B, PERC, HW]
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint3 tid [[thread_position_in_threadgroup]]
+) {
+    int n = int(tgid.x) * 32 + int(tid.x);
+    int ci = int(tgid.y) * 8 + int(tid.y);
+    int b = int(tgid.z);
+    if (b >= B || ci >= PERC || n >= HW) return;
+
+    const device float* wRow = weight_t + ci * HIDDEN;
+    float sum = 0.0f;
+    for (int co = 0; co < HIDDEN; co += 4) {
+        float4 dout4 = float4(
+            dOutput[(b * HIDDEN + co + 0) * HW + n],
+            dOutput[(b * HIDDEN + co + 1) * HW + n],
+            dOutput[(b * HIDDEN + co + 2) * HW + n],
+            dOutput[(b * HIDDEN + co + 3) * HW + n]
+        );
+        const device float4* w4 = reinterpret_cast<const device float4*>(wRow + co);
+        sum += dot(dout4, *w4);
+    }
+    dInput[(b * PERC + ci) * HW + n] = sum;
+}
+
+// Model-specialized tiled data grad for fc2 fused with ReLU backward.
+kernel void fc2_data_grad_relu_tiled(
+    device const float* dOutput  [[buffer(0)]],  // [B, C, HW]
+    device const float* weight_t [[buffer(1)]],  // [HIDDEN, C]
+    device const float* hidden   [[buffer(2)]],  // [B, HIDDEN, HW]
+    device float* dInput         [[buffer(3)]],  // [B, HIDDEN, HW]
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint3 tid [[thread_position_in_threadgroup]]
+) {
+    int n = int(tgid.x) * 32 + int(tid.x);
+    int ci = int(tgid.y) * 8 + int(tid.y);
+    int b = int(tgid.z);
+    if (b >= B || ci >= HIDDEN || n >= HW) return;
+
+    const device float* wRow = weight_t + ci * C;
+    float sum = 0.0f;
+    for (int co = 0; co < C; co += 4) {
+        float4 dout4 = float4(
+            dOutput[(b * C + co + 0) * HW + n],
+            dOutput[(b * C + co + 1) * HW + n],
+            dOutput[(b * C + co + 2) * HW + n],
+            dOutput[(b * C + co + 3) * HW + n]
+        );
+        const device float4* w4 = reinterpret_cast<const device float4*>(wRow + co);
+        sum += dot(dout4, *w4);
+    }
+
+    int outIdx = (b * HIDDEN + ci) * HW + n;
+    dInput[outIdx] = hidden[outIdx] > 0.0f ? sum : 0.0f;
+}
+
+// Model-specialized tiled weight grad for fc1: dFC1W from dFC1Raw and perc.
+kernel void fc1_weight_grad_tiled(
+    device const float* dOutput [[buffer(0)]],   // [B, HIDDEN, HW]
+    device const float* input   [[buffer(1)]],   // [B, PERC, HW]
+    device float* dWeight       [[buffer(2)]],   // [HIDDEN, PERC]
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint3 tid [[thread_position_in_threadgroup]]
+) {
+    int ci = int(tgid.x) * 8 + int(tid.x);
+    int co = int(tgid.y) * 8 + int(tid.y);
+    if (ci >= PERC || co >= HIDDEN) return;
+
+    float sum = 0.0f;
+    for (int b = 0; b < B; ++b) {
+        int outBase = (b * HIDDEN + co) * HW;
+        int inBase = (b * PERC + ci) * HW;
+        for (int n = 0; n < HW; n += 4) {
+            const device float4* out4 = reinterpret_cast<const device float4*>(dOutput + outBase + n);
+            const device float4* in4 = reinterpret_cast<const device float4*>(input + inBase + n);
+            sum += dot(*out4, *in4);
+        }
+    }
+
+    dWeight[co * PERC + ci] = sum;
+}
+
+// Model-specialized tiled weight grad for fc2: dFC2W from dResidual and hidden.
+kernel void fc2_weight_grad_tiled(
+    device const float* dOutput [[buffer(0)]],   // [B, C, HW]
+    device const float* input   [[buffer(1)]],   // [B, HIDDEN, HW]
+    device float* dWeight       [[buffer(2)]],   // [C, HIDDEN]
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint3 tid [[thread_position_in_threadgroup]]
+) {
+    int ci = int(tgid.x) * 8 + int(tid.x);
+    int co = int(tgid.y) * 8 + int(tid.y);
+    if (ci >= HIDDEN || co >= C) return;
+
+    float sum = 0.0f;
+    for (int b = 0; b < B; ++b) {
+        int outBase = (b * C + co) * HW;
+        int inBase = (b * HIDDEN + ci) * HW;
+        for (int n = 0; n < HW; n += 4) {
+            const device float4* out4 = reinterpret_cast<const device float4*>(dOutput + outBase + n);
+            const device float4* in4 = reinterpret_cast<const device float4*>(input + inBase + n);
+            sum += dot(*out4, *in4);
+        }
+    }
+
+    dWeight[co * HIDDEN + ci] = sum;
+}
+
 // 1x1 conv weight gradient: dWeight[co,ci] = sum_b,y,x(dOutput[b,co,y,x] * input[b,ci,y,x])
 // Thread: (ci, co) — one thread per weight element
 kernel void conv1x1_weight_grad(
@@ -324,17 +753,35 @@ kernel void conv1x1_weight_grad(
     device float* dWeight       [[buffer(2)]],
     constant int& Cin           [[buffer(3)]],
     constant int& Cout          [[buffer(4)]],
-    uint2 gid [[thread_position_in_grid]]  // (ci, co)
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
 ) {
-    int ci = gid.x;
-    int co = gid.y;
+    int ci = int(tgid.x);
+    int co = int(tgid.y);
     if (ci >= Cin || co >= Cout) return;
 
+    threadgroup float partials[REDUCE_THREADS];
     float sum = 0.0f;
-    for (int b_idx = 0; b_idx < B; b_idx++) {
-        for (int yx = 0; yx < HW; yx++) {
-            sum += dOutput[(b_idx * Cout + co) * HW + yx] * input[(b_idx * Cin + ci) * HW + yx];
+    for (int b_idx = 0; b_idx < B; ++b_idx) {
+        int outBase = (b_idx * Cout + co) * HW;
+        int inBase = (b_idx * Cin + ci) * HW;
+        for (uint yx = tid * 4; yx < uint(HW); yx += REDUCE_THREADS * 4) {
+            const device float4* out4 = reinterpret_cast<const device float4*>(dOutput + outBase + int(yx));
+            const device float4* in4 = reinterpret_cast<const device float4*>(input + inBase + int(yx));
+            sum += dot(*out4, *in4);
         }
     }
-    dWeight[co * Cin + ci] = sum;
+    partials[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = REDUCE_THREADS / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        dWeight[co * Cin + ci] = partials[0];
+    }
 }
