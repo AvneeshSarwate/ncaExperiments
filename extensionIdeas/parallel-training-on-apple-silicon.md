@@ -78,6 +78,26 @@ For a model this tiny (8K params, 72x72 grid), CPU compute is trivial. The entir
 ### Custom Metal shader for training
 Write the entire NCA forward pass (perceive + update + mask) as a single Metal compute kernel, reducing each NCA step to 1 dispatch instead of ~12. Combine with PyTorch via custom MPS ops. High engineering effort but would directly solve the dispatch bottleneck.
 
+## CONFIRMED: MPSGraph native training (March 2026 PoC)
+
+A Swift proof-of-concept in `nca-mpsgraph/` validated:
+
+1. **Forward pass parity**: MPSGraph NCA matches PyTorch within 2.86e-6 max error over 10 steps (float32 rounding only) when using hard threshold alive mask
+2. **Single-step gradients**: All weight tensors (fc1_w, fc1_b, fc2_w) receive non-zero gradients via `graph.gradients()`
+3. **For-loop + gradients (BPTT)**: `graph.for(numberOfIterations:...)` with `graph.gradients()` through the loop body **works** — all gradients non-zero through 4 NCA iterations
+
+**Key finding**: MPSGraph's `greaterThan` has no gradient implementation (assertion failure). The fix is using `sigmoid((maxAlpha - 0.1) * 100)` as a smooth differentiable approximation of the alive mask. With steepness=100, this is nearly identical to a hard threshold.
+
+**What this enables**: The entire training step (64-96 NCA forward passes + backprop + weight update) can be a SINGLE MPSGraph execution — zero CPU-GPU synchronization per NCA step. This directly eliminates the ~1000+ kernel dispatch bottleneck.
+
+**Remaining work to build the full trainer**:
+- Pool management (sample, sort by loss, seed replacement, damage)
+- Stochastic fire mask (MPSGraph has random ops)
+- Adam optimizer (MPSGraph has built-in Adam)
+- LR schedule (piecewise constant)
+- Weight I/O (load/save, export for WebGPU)
+- Benchmark vs PyTorch MPS to quantify the speedup
+
 ## Current recommendation
 
-For < 26 characters, just run sequentially on PyTorch MPS. The grouped conv trick (section 1 above) remains the most practical single-process optimization that stays in PyTorch.
+For < 26 characters, just run sequentially on PyTorch MPS. For full alphabet or iterative training, the MPSGraph native path is confirmed viable and should give significant speedup on Apple Silicon. On NVIDIA GPUs (RunPod), use PyTorch CUDA with NVIDIA MPS daemon for multi-process parallelism.

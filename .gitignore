@@ -17,3 +17,5 @@ output/*/analysis.png
 output/*/target_*.png
 
 *.DS_Store*
+
+*.build*
