@@ -32,12 +32,19 @@ app.innerHTML = `
   <div class="nca-controls">
     <label class="file-upload-btn">
       Load weights.bin
-      <input type="file" id="weights-upload" accept=".bin" hidden>
+      <input type="file" id="weights-upload" accept=".bin" multiple hidden>
+    </label>
+    <label>Model name: <input type="text" id="model-name" value="" placeholder="optional"></label>
+    <label>Active model:
+      <select id="model-select" disabled>
+        <option value="">No models loaded</option>
+      </select>
     </label>
     <button id="nca-reset" disabled>Reset</button>
     <label>Steps/frame: <input type="range" id="steps-per-frame" min="1" max="16" value="4" disabled> <span id="spf-label">4</span></label>
     <label>Erase size: <input type="range" id="erase-size" min="8" max="80" value="32" disabled> <span id="erase-label">32</span>px</label>
   </div>
+  <div class="info" id="model-status">Switching models keeps the current NCA state.</div>
   <div class="nca-canvas-container">
     <canvas id="nca-canvas" width="${NCA_CANVAS_SIZE}" height="${NCA_CANVAS_SIZE}"></canvas>
   </div>
@@ -167,35 +174,124 @@ render();
 
 const ncaCanvas = document.getElementById('nca-canvas') as HTMLCanvasElement;
 const statusEl = document.getElementById('nca-status')!;
+const modelStatusEl = document.getElementById('model-status')!;
+const modelNameInput = document.getElementById('model-name') as HTMLInputElement;
+const modelSelect = document.getElementById('model-select') as HTMLSelectElement;
 let viewer: NCAViewer | null = null;
+const loadedModels = new Map<string, Float32Array>();
+const EXPECTED_WEIGHTS = 8320;
+
+function makeUniqueModelName(baseName: string, reservedNames: Set<string>): string {
+  const trimmed = baseName.trim();
+  const stem = trimmed.length > 0 ? trimmed : `model ${reservedNames.size + 1}`;
+  if (!reservedNames.has(stem)) return stem;
+
+  let suffix = 2;
+  while (reservedNames.has(`${stem} (${suffix})`)) {
+    suffix += 1;
+  }
+  return `${stem} (${suffix})`;
+}
+
+function defaultModelName(file: File): string {
+  const raw = file.name.replace(/\.[^.]+$/, '');
+  return raw && raw !== 'weights' ? raw : 'weights';
+}
+
+function refreshModelSelect(activeName?: string): void {
+  modelSelect.innerHTML = '';
+  for (const name of loadedModels.keys()) {
+    const option = document.createElement('option');
+    option.value = name;
+    option.textContent = name;
+    modelSelect.appendChild(option);
+  }
+
+  modelSelect.disabled = loadedModels.size === 0;
+  if (activeName && loadedModels.has(activeName)) {
+    modelSelect.value = activeName;
+  }
+}
+
+function updateViewerStatus(): void {
+  if (!viewer || !viewer.modelName) {
+    statusEl.textContent = 'Upload trained weights to start';
+    modelStatusEl.textContent = 'Switching models keeps the current NCA state.';
+    return;
+  }
+
+  statusEl.textContent = `Running model "${viewer.modelName}" — click the NCA canvas to erase`;
+  modelStatusEl.textContent = `${loadedModels.size} model${loadedModels.size === 1 ? '' : 's'} loaded. Switching models keeps the current NCA state.`;
+}
 
 document.getElementById('weights-upload')!.addEventListener('change', async (e) => {
-  const file = (e.target as HTMLInputElement).files?.[0];
-  if (!file) return;
+  const inputEl = e.target as HTMLInputElement;
+  const files = Array.from(inputEl.files ?? []);
+  if (files.length === 0) return;
 
   statusEl.textContent = 'Initializing WebGPU...';
 
   try {
-    const arrayBuf = await file.arrayBuffer();
-    const weights = new Float32Array(arrayBuf);
+    const uploadedModels: Array<{ name: string; weights: Float32Array }> = [];
+    const reservedNames = new Set(loadedModels.keys());
 
-    if (weights.length !== 8320) {
-      statusEl.textContent = `Error: expected 8320 floats, got ${weights.length}`;
-      return;
+    for (const file of files) {
+      const arrayBuf = await file.arrayBuffer();
+      const weights = new Float32Array(arrayBuf);
+
+      if (weights.length !== EXPECTED_WEIGHTS) {
+        statusEl.textContent = `Error: ${file.name} expected ${EXPECTED_WEIGHTS} floats, got ${weights.length}`;
+        return;
+      }
+
+      const requestedName = files.length === 1 && modelNameInput.value.trim().length > 0
+        ? modelNameInput.value
+        : defaultModelName(file);
+      const uniqueName = makeUniqueModelName(requestedName, reservedNames);
+      reservedNames.add(uniqueName);
+      uploadedModels.push({ name: uniqueName, weights });
     }
 
-    if (viewer) viewer.destroy();
+    if (!viewer) {
+      const first = uploadedModels[0];
+      viewer = new NCAViewer(ncaCanvas);
+      await viewer.init(first.name, first.weights, computeWgsl, renderWgsl);
+      loadedModels.set(first.name, first.weights);
 
-    viewer = new NCAViewer(ncaCanvas);
-    await viewer.init(weights, computeWgsl, renderWgsl);
-    viewer.start();
+      for (const model of uploadedModels.slice(1)) {
+        viewer.addModel(model.name, model.weights);
+        loadedModels.set(model.name, model.weights);
+      }
 
-    statusEl.textContent = 'Running — click the NCA canvas to erase';
+      viewer.start();
 
-    // Enable controls
-    (document.getElementById('nca-reset') as HTMLButtonElement).disabled = false;
-    (document.getElementById('steps-per-frame') as HTMLInputElement).disabled = false;
-    (document.getElementById('erase-size') as HTMLInputElement).disabled = false;
+      (document.getElementById('nca-reset') as HTMLButtonElement).disabled = false;
+      (document.getElementById('steps-per-frame') as HTMLInputElement).disabled = false;
+      (document.getElementById('erase-size') as HTMLInputElement).disabled = false;
+      refreshModelSelect(first.name);
+    } else {
+      for (const model of uploadedModels) {
+        viewer.addModel(model.name, model.weights);
+        loadedModels.set(model.name, model.weights);
+      }
+      refreshModelSelect(viewer.modelName ?? uploadedModels[0].name);
+    }
+
+    modelNameInput.value = '';
+    updateViewerStatus();
+  } catch (err) {
+    statusEl.textContent = `Error: ${err}`;
+    console.error(err);
+  } finally {
+    inputEl.value = '';
+  }
+});
+
+modelSelect.addEventListener('change', () => {
+  if (!viewer || !modelSelect.value) return;
+  try {
+    viewer.setModel(modelSelect.value);
+    updateViewerStatus();
   } catch (err) {
     statusEl.textContent = `Error: ${err}`;
     console.error(err);
@@ -204,6 +300,7 @@ document.getElementById('weights-upload')!.addEventListener('change', async (e) 
 
 document.getElementById('nca-reset')!.addEventListener('click', () => {
   viewer?.reset();
+  updateViewerStatus();
 });
 
 document.getElementById('steps-per-frame')!.addEventListener('input', (e) => {

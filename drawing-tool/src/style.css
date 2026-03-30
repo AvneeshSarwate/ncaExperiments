@@ -87,6 +87,15 @@ input[type="text"] {
   text-align: center;
 }
 
+select {
+  padding: 6px 8px;
+  border: 1px solid #555;
+  border-radius: 4px;
+  background: #2a2a4a;
+  color: #e0e0e0;
+  font-size: 14px;
+}
+
 .info {
   font-size: 13px;
   color: #888;
@@ -140,7 +149,17 @@ h2 {
   height: 576px;
 }
 
-button:disabled, input:disabled {
+#model-name {
+  width: 110px;
+  text-align: left;
+}
+
+#model-select {
+  min-width: 120px;
+  max-width: 220px;
+}
+
+button:disabled, input:disabled, select:disabled {
   opacity: 0.4;
   cursor: default;
 }

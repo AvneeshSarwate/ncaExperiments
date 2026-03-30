@@ -23,8 +23,11 @@ export class NCAViewer {
   private stateA!: GPUBuffer;
   private stateB!: GPUBuffer;
   private weightsBuffer!: GPUBuffer;
+  private modelBuffers = new Map<string, GPUBuffer>();
+  private activeModelName: string | null = null;
   private paramsBuffer!: GPUBuffer;
   private renderUniformBuffer!: GPUBuffer;
+  private computeBGL!: GPUBindGroupLayout;
 
   private ncaPipeline!: GPUComputePipeline;
   private alivePipeline!: GPUComputePipeline;
@@ -46,6 +49,7 @@ export class NCAViewer {
   }
 
   async init(
+    initialModelName: string,
     weights: Float32Array,
     computeWgsl: string,
     renderWgsl: string,
@@ -71,7 +75,6 @@ export class NCAViewer {
     this.stateA = makeStorage();
     this.stateB = makeStorage();
 
-    this.weightsBuffer = this.bufferWithData(weights, GPUBufferUsage.STORAGE);
     this.paramsBuffer = this.device.createBuffer({
       size: 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -86,7 +89,7 @@ export class NCAViewer {
 
     // --- compute pipelines ---
     const computeModule = this.device.createShaderModule({ code: computeWgsl });
-    const computeBGL = this.device.createBindGroupLayout({
+    this.computeBGL = this.device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
         { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
@@ -94,7 +97,7 @@ export class NCAViewer {
         { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
       ],
     });
-    const computeLayout = this.device.createPipelineLayout({ bindGroupLayouts: [computeBGL] });
+    const computeLayout = this.device.createPipelineLayout({ bindGroupLayouts: [this.computeBGL] });
 
     this.ncaPipeline = this.device.createComputePipeline({
       layout: computeLayout,
@@ -104,15 +107,6 @@ export class NCAViewer {
       layout: computeLayout,
       compute: { module: computeModule, entryPoint: "post_alive" },
     });
-
-    const bindEntries = (read: GPUBuffer, write: GPUBuffer): GPUBindGroupEntry[] => [
-      { binding: 0, resource: { buffer: read } },
-      { binding: 1, resource: { buffer: write } },
-      { binding: 2, resource: { buffer: this.weightsBuffer } },
-      { binding: 3, resource: { buffer: this.paramsBuffer } },
-    ];
-    this.bgForward = this.device.createBindGroup({ layout: computeBGL, entries: bindEntries(this.stateA, this.stateB) });
-    this.bgReverse = this.device.createBindGroup({ layout: computeBGL, entries: bindEntries(this.stateB, this.stateA) });
 
     // --- render pipeline ---
     const renderModule = this.device.createShaderModule({ code: renderWgsl });
@@ -140,8 +134,39 @@ export class NCAViewer {
       ],
     });
 
+    this.addModel(initialModelName, weights);
+    this.setModel(initialModelName);
+
     // --- init seed ---
     this.reset();
+  }
+
+  addModel(name: string, weights: Float32Array): void {
+    const existing = this.modelBuffers.get(name);
+    if (existing) existing.destroy();
+
+    const buffer = this.bufferWithData(weights, GPUBufferUsage.STORAGE);
+    this.modelBuffers.set(name, buffer);
+
+    if (this.activeModelName === name) {
+      this.weightsBuffer = buffer;
+      this.rebuildComputeBindGroups();
+    }
+  }
+
+  setModel(name: string): void {
+    const nextBuffer = this.modelBuffers.get(name);
+    if (!nextBuffer) {
+      throw new Error(`Unknown model: ${name}`);
+    }
+
+    this.activeModelName = name;
+    this.weightsBuffer = nextBuffer;
+    this.rebuildComputeBindGroups();
+  }
+
+  get modelName(): string | null {
+    return this.activeModelName;
   }
 
   reset(): void {
@@ -197,7 +222,10 @@ export class NCAViewer {
     this.stop();
     this.stateA.destroy();
     this.stateB.destroy();
-    this.weightsBuffer.destroy();
+    for (const buffer of this.modelBuffers.values()) {
+      buffer.destroy();
+    }
+    this.modelBuffers.clear();
     this.paramsBuffer.destroy();
     this.renderUniformBuffer.destroy();
   }
@@ -269,6 +297,24 @@ export class NCAViewer {
     u32[4] = GRID_W;
     u32[5] = GRID_H;
     this.device.queue.writeBuffer(this.renderUniformBuffer, 0, buf);
+  }
+
+  private rebuildComputeBindGroups(): void {
+    const bindEntries = (read: GPUBuffer, write: GPUBuffer): GPUBindGroupEntry[] => [
+      { binding: 0, resource: { buffer: read } },
+      { binding: 1, resource: { buffer: write } },
+      { binding: 2, resource: { buffer: this.weightsBuffer } },
+      { binding: 3, resource: { buffer: this.paramsBuffer } },
+    ];
+
+    this.bgForward = this.device.createBindGroup({
+      layout: this.computeBGL,
+      entries: bindEntries(this.stateA, this.stateB),
+    });
+    this.bgReverse = this.device.createBindGroup({
+      layout: this.computeBGL,
+      entries: bindEntries(this.stateB, this.stateA),
+    });
   }
 
   private bufferWithData(data: Float32Array, usage: GPUBufferUsageFlags): GPUBuffer {
