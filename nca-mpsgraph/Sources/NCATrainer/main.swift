@@ -88,6 +88,7 @@ class NCAMetal {
     let aliveMaskFromStatePSO: MTLComputePipelineState
     let applyTwoMasksPSO: MTLComputePipelineState
     let applyTwoMasksStoreLifePSO: MTLComputePipelineState
+    let rolloutTwoStepsFusedPSO: MTLComputePipelineState
 
     // 1x1 conv pipelines
     let conv1x1FwdPSO: MTLComputePipelineState
@@ -162,6 +163,7 @@ class NCAMetal {
         aliveMaskFromStatePSO = pso("alive_mask_from_state")
         applyTwoMasksPSO = pso("apply_two_masks")
         applyTwoMasksStoreLifePSO = pso("apply_two_masks_store_life")
+        rolloutTwoStepsFusedPSO = pso("rollout_two_steps_fused")
         bwdMaskedResidualPSO = pso("backward_masked_residual")
         reluBackwardPSO = pso("relu_backward")
         biasGradPSO = pso("bias_grad")
@@ -639,13 +641,13 @@ class NCAMetal {
         )
     }
 
-    func makeRolloutScratch() -> RolloutScratch {
+    func makeRolloutScratch(options: MTLResourceOptions = .storageModeShared) -> RolloutScratch {
         return RolloutScratch(
-            perc: makeBuffer(size: BATCH * PERC * HW),
-            hidden: makeBuffer(size: BATCH * HIDDEN * HW),
-            delta: makeBuffer(size: BATCH * C * HW),
-            preMask: makeBuffer(size: BATCH * HW),
-            postMask: makeBuffer(size: BATCH * HW)
+            perc: makeBuffer(size: BATCH * PERC * HW, options: options),
+            hidden: makeBuffer(size: BATCH * HIDDEN * HW, options: options),
+            delta: makeBuffer(size: BATCH * C * HW, options: options),
+            preMask: makeBuffer(size: BATCH * HW, options: options),
+            postMask: makeBuffer(size: BATCH * HW, options: options)
         )
     }
 
@@ -688,6 +690,61 @@ class NCAMetal {
         enc.setBuffer(scratch.postMask, offset: 0, index: 2)
         enc.setBuffer(stateOut, offset: 0, index: 3)
         dispatchGrid(enc, width: GS, height: GS, depth: BATCH * C)
+    }
+
+    func encodeForwardTwoStepsFused(_ enc: MTLComputeCommandEncoder, stateIn: MTLBuffer, stateOut: MTLBuffer,
+                                    fc1WT: MTLBuffer, fc1B: MTLBuffer, fc2WT: MTLBuffer) {
+        enc.setComputePipelineState(rolloutTwoStepsFusedPSO)
+        enc.setBuffer(stateIn, offset: 0, index: 0)
+        enc.setBuffer(fc1WT, offset: 0, index: 1)
+        enc.setBuffer(fc1B, offset: 0, index: 2)
+        enc.setBuffer(fc2WT, offset: 0, index: 3)
+        enc.setBuffer(stateOut, offset: 0, index: 4)
+        dispatchThreadgroups(
+            enc,
+            width: GS / 8,
+            height: GS / 8,
+            depth: BATCH,
+            threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1)
+        )
+    }
+
+    @discardableResult
+    func encodeForwardRolloutFast(_ enc: MTLComputeCommandEncoder, steps: Int,
+                                  stateA: MTLBuffer, stateB: MTLBuffer, scratch: RolloutScratch,
+                                  fc1WT: MTLBuffer, fc1B: MTLBuffer, fc2WT: MTLBuffer) -> MTLBuffer {
+        var currentIn = stateA
+        var currentOut = stateB
+        for _ in 0..<steps {
+            encodeForwardStepFast(enc, stateIn: currentIn, stateOut: currentOut, scratch: scratch,
+                                  fc1WT: fc1WT, fc1B: fc1B, fc2WT: fc2WT)
+            swap(&currentIn, &currentOut)
+        }
+        return currentIn
+    }
+
+    @discardableResult
+    func encodeForwardRolloutFused2(_ enc: MTLComputeCommandEncoder, steps: Int,
+                                    stateA: MTLBuffer, stateB: MTLBuffer, scratch: RolloutScratch,
+                                    fc1WT: MTLBuffer, fc1B: MTLBuffer, fc2WT: MTLBuffer) -> MTLBuffer {
+        var currentIn = stateA
+        var currentOut = stateB
+        var remaining = steps
+
+        while remaining >= 2 {
+            encodeForwardTwoStepsFused(enc, stateIn: currentIn, stateOut: currentOut,
+                                       fc1WT: fc1WT, fc1B: fc1B, fc2WT: fc2WT)
+            swap(&currentIn, &currentOut)
+            remaining -= 2
+        }
+
+        if remaining == 1 {
+            encodeForwardStepFast(enc, stateIn: currentIn, stateOut: currentOut, scratch: scratch,
+                                  fc1WT: fc1WT, fc1B: fc1B, fc2WT: fc2WT)
+            swap(&currentIn, &currentOut)
+        }
+
+        return currentIn
     }
 
     func makeFastTrainScratch(options: MTLResourceOptions = .storageModeShared) -> FastTrainScratch {
@@ -1051,28 +1108,30 @@ func verifySingleStep(_ metal: NCAMetal, _ weights: LoadedWeights) -> Bool {
 }
 
 func verifyRollout(_ metal: NCAMetal, _ weights: LoadedWeights, steps: Int) -> Bool {
-    print("\n=== Rollout Accuracy (\(steps) steps) ===")
+    print("\n=== GPU-Resident Rollout Final Accuracy (\(steps) steps) ===")
     let seedBatch = repeatSample(loadRolloutRef(step: 0), count: BATCH)
-    let seedBuf = metal.makeBuffer(seedBatch)
-
+    let seedPrivate = metal.makePrivateBuffer(seedBatch)
+    let stateA = metal.makeBuffer(size: BATCH * STATE, options: .storageModePrivate)
+    let stateB = metal.makeBuffer(size: BATCH * STATE, options: .storageModePrivate)
+    let scratch = metal.makeRolloutScratch(options: .storageModePrivate)
+    let finalShared = metal.makeBuffer(size: BATCH * STATE)
     let cmd = metal.queue.makeCommandBuffer()!
-    var current = seedBuf
-    var outputs = [MTLBuffer]()
-    outputs.reserveCapacity(steps)
+    let seedBlit = cmd.makeBlitCommandEncoder()!
+    seedBlit.copy(from: seedPrivate, sourceOffset: 0, to: stateA, destinationOffset: 0, size: seedPrivate.length)
+    seedBlit.endEncoding()
 
-    for _ in 0..<steps {
-        let forward = metal.forwardStep(cmd, state: current, fc1W: weights.fc1W, fc1B: weights.fc1B, fc2W: weights.fc2W, fireRate: 1.0)
-        current = forward.output
-        outputs.append(current)
-    }
-    commitAndWait(cmd, label: "rollout command buffer")
+    let enc = cmd.makeComputeCommandEncoder()!
+    let finalPrivate = metal.encodeForwardRolloutFast(enc, steps: steps, stateA: stateA, stateB: stateB, scratch: scratch,
+                                                      fc1WT: weights.fc1WT, fc1B: weights.fc1B, fc2WT: weights.fc2WT)
+    enc.endEncoding()
 
-    var ok = true
-    for step in 1...steps {
-        let batched = metal.readBuffer(outputs[step - 1], count: BATCH * STATE)
-        ok = compare(String(format: "step_%03d", step), sample0(batched, sampleSize: STATE), loadRolloutRef(step: step), tolerance: 5e-4) && ok
-    }
-    return ok
+    let readbackBlit = cmd.makeBlitCommandEncoder()!
+    readbackBlit.copy(from: finalPrivate, sourceOffset: 0, to: finalShared, destinationOffset: 0, size: finalShared.length)
+    readbackBlit.endEncoding()
+
+    commitAndWait(cmd, label: "gpu-resident rollout command buffer")
+    let batched = metal.readBuffer(finalShared, count: BATCH * STATE)
+    return compare("rollout_final", sample0(batched, sampleSize: STATE), loadRolloutRef(step: steps), tolerance: 5e-4)
 }
 
 func average(_ values: [Double]) -> Double {
@@ -1128,28 +1187,60 @@ func runBenchmarks(_ metal: NCAMetal, _ weights: LoadedWeights, options: RunOpti
     let dOutputShared = metal.makeBuffer(loadOpRef("d_output"))
     let opInputPrivate = metal.makePrivateCopy(of: opInputShared)
     let dOutputPrivate = metal.makePrivateCopy(of: dOutputShared)
-    let fastStateA = metal.makeBuffer(seedBatch)
-    let fastStateB = metal.makeBuffer(size: BATCH * STATE)
-    let fastScratch = metal.makeRolloutScratch()
+    let rolloutSeedPrivate = metal.makePrivateBuffer(seedBatch)
+    let rolloutStateA = metal.makeBuffer(size: BATCH * STATE, options: .storageModePrivate)
+    let rolloutStateB = metal.makeBuffer(size: BATCH * STATE, options: .storageModePrivate)
+    let rolloutScratch = metal.makeRolloutScratch(options: .storageModePrivate)
+    let rolloutReadback = metal.makeBuffer(size: BATCH * STATE)
     let fastTrainValidationScratch = metal.makeFastTrainScratch()
     let fastTrainBenchmarkScratch = metal.makeFastTrainScratch(options: .storageModePrivate)
 
-    // Validate the optimized rollout path against the PyTorch reference before timing it.
+    // Validate the GPU-resident rollout path against the PyTorch reference before timing it.
     let validationCmd = metal.queue.makeCommandBuffer()!
+    let validationSeedBlit = validationCmd.makeBlitCommandEncoder()!
+    validationSeedBlit.copy(from: rolloutSeedPrivate, sourceOffset: 0, to: rolloutStateA, destinationOffset: 0, size: rolloutSeedPrivate.length)
+    validationSeedBlit.endEncoding()
     let validationEnc = validationCmd.makeComputeCommandEncoder()!
-    metal.writeBuffer(fastStateA, data: seedBatch)
-    var currentIn = fastStateA
-    var currentOut = fastStateB
-    for _ in 0..<options.rolloutSteps {
-        metal.encodeForwardStepFast(validationEnc, stateIn: currentIn, stateOut: currentOut, scratch: fastScratch,
-                                    fc1WT: weights.fc1WT, fc1B: weights.fc1B, fc2WT: weights.fc2WT)
-        swap(&currentIn, &currentOut)
-    }
+    let fastFinalBuf = metal.encodeForwardRolloutFast(validationEnc, steps: options.rolloutSteps,
+                                                      stateA: rolloutStateA, stateB: rolloutStateB, scratch: rolloutScratch,
+                                                      fc1WT: weights.fc1WT, fc1B: weights.fc1B, fc2WT: weights.fc2WT)
     validationEnc.endEncoding()
+    let validationReadbackBlit = validationCmd.makeBlitCommandEncoder()!
+    validationReadbackBlit.copy(from: fastFinalBuf, sourceOffset: 0, to: rolloutReadback, destinationOffset: 0, size: rolloutReadback.length)
+    validationReadbackBlit.endEncoding()
     commitAndWait(validationCmd, label: "fast rollout validation")
-    let fastFinal = metal.readBuffer(currentIn, count: BATCH * STATE)
+    let fastFinal = metal.readBuffer(rolloutReadback, count: BATCH * STATE)
     guard compare("fast_final", sample0(fastFinal, sampleSize: STATE), loadRolloutRef(step: options.rolloutSteps), tolerance: 5e-4) else {
         fatalError("Fast rollout path mismatched the reference output")
+    }
+
+    let fusedValidationCmd = metal.queue.makeCommandBuffer()!
+    let fusedValidationSeedBlit = fusedValidationCmd.makeBlitCommandEncoder()!
+    fusedValidationSeedBlit.copy(from: rolloutSeedPrivate, sourceOffset: 0, to: rolloutStateA, destinationOffset: 0, size: rolloutSeedPrivate.length)
+    fusedValidationSeedBlit.endEncoding()
+    let fusedValidationEnc = fusedValidationCmd.makeComputeCommandEncoder()!
+    let fusedFinalBuf = metal.encodeForwardRolloutFused2(fusedValidationEnc, steps: options.rolloutSteps,
+                                                         stateA: rolloutStateA, stateB: rolloutStateB, scratch: rolloutScratch,
+                                                         fc1WT: weights.fc1WT, fc1B: weights.fc1B, fc2WT: weights.fc2WT)
+    fusedValidationEnc.endEncoding()
+    let fusedReadbackBlit = fusedValidationCmd.makeBlitCommandEncoder()!
+    fusedReadbackBlit.copy(from: fusedFinalBuf, sourceOffset: 0, to: rolloutReadback, destinationOffset: 0, size: rolloutReadback.length)
+    fusedReadbackBlit.endEncoding()
+    commitAndWait(fusedValidationCmd, label: "fused rollout validation")
+    let fusedFinal = metal.readBuffer(rolloutReadback, count: BATCH * STATE)
+    let fusedSample = sample0(fusedFinal, sampleSize: STATE)
+    let fusedRef = loadRolloutRef(step: options.rolloutSteps)
+    if !compare("fused2_final", fusedSample, fusedRef, tolerance: 5e-4) {
+        var maxErr: Float = 0
+        var maxIdx = 0
+        for i in 0..<fusedSample.count {
+            let err = abs(fusedSample[i] - fusedRef[i])
+            if err > maxErr {
+                maxErr = err
+                maxIdx = i
+            }
+        }
+        log("Fused 2-step rollout mismatch: max_err=\(maxErr) idx=\(maxIdx) gpu=\(fusedSample[maxIdx]) ref=\(fusedRef[maxIdx])")
     }
 
     let trainValidationCmd = metal.queue.makeCommandBuffer()!
@@ -1179,24 +1270,39 @@ func runBenchmarks(_ metal: NCAMetal, _ weights: LoadedWeights, options: RunOpti
         fatalError("Fast training d_state mismatched the reference output")
     }
 
-    let rolloutSummary = benchmark("forward_rollout_\(options.rolloutSteps)",
+    let rolloutSummary = benchmark("forward_rollout_resident_\(options.rolloutSteps)",
                                    iterations: options.benchmarkIterations,
                                    warmup: options.warmupIterations,
                                    workItemsPerIteration: options.rolloutSteps) {
         let cmd = metal.queue.makeCommandBuffer()!
+        let seedBlit = cmd.makeBlitCommandEncoder()!
+        seedBlit.copy(from: rolloutSeedPrivate, sourceOffset: 0, to: rolloutStateA, destinationOffset: 0, size: rolloutSeedPrivate.length)
+        seedBlit.endEncoding()
         let enc = cmd.makeComputeCommandEncoder()!
-        metal.writeBuffer(fastStateA, data: seedBatch)
-        var currentIn = fastStateA
-        var currentOut = fastStateB
-        for _ in 0..<options.rolloutSteps {
-            metal.encodeForwardStepFast(enc, stateIn: currentIn, stateOut: currentOut, scratch: fastScratch,
-                                        fc1WT: weights.fc1WT, fc1B: weights.fc1B, fc2WT: weights.fc2WT)
-            swap(&currentIn, &currentOut)
-        }
+        _ = metal.encodeForwardRolloutFast(enc, steps: options.rolloutSteps,
+                                           stateA: rolloutStateA, stateB: rolloutStateB, scratch: rolloutScratch,
+                                           fc1WT: weights.fc1WT, fc1B: weights.fc1B, fc2WT: weights.fc2WT)
         enc.endEncoding()
         return cmd
     }
     printBenchmark(rolloutSummary)
+
+    let fusedRolloutSummary = benchmark("forward_rollout_fused2_\(options.rolloutSteps)",
+                                        iterations: options.benchmarkIterations,
+                                        warmup: options.warmupIterations,
+                                        workItemsPerIteration: options.rolloutSteps) {
+        let cmd = metal.queue.makeCommandBuffer()!
+        let seedBlit = cmd.makeBlitCommandEncoder()!
+        seedBlit.copy(from: rolloutSeedPrivate, sourceOffset: 0, to: rolloutStateA, destinationOffset: 0, size: rolloutSeedPrivate.length)
+        seedBlit.endEncoding()
+        let enc = cmd.makeComputeCommandEncoder()!
+        _ = metal.encodeForwardRolloutFused2(enc, steps: options.rolloutSteps,
+                                             stateA: rolloutStateA, stateB: rolloutStateB, scratch: rolloutScratch,
+                                             fc1WT: weights.fc1WT, fc1B: weights.fc1B, fc2WT: weights.fc2WT)
+        enc.endEncoding()
+        return cmd
+    }
+    printBenchmark(fusedRolloutSummary)
 
     let trainLikeSummary = benchmark("forward_backward_1",
                                      iterations: options.benchmarkIterations,

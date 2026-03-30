@@ -377,6 +377,274 @@ kernel void apply_two_masks_store_life(
     output[idx] = input[idx] * lm;
 }
 
+constant int FUSED2_THREADS = 8;
+constant int FUSED2_OUT_TILE = 8;
+constant int FUSED2_INPUT_TILE = 16;
+constant int FUSED2_STEP1_TILE = 12;
+constant int FUSED2_ALPHA14_TILE = 14;
+constant int FUSED2_ALPHA10_TILE = 10;
+
+inline int fused_state_idx(int pitch, int x, int y, int c) {
+    return ((y * pitch + x) * C) + c;
+}
+
+inline float fused_read_state(threadgroup const float* state, int pitch, int x, int y, int c) {
+    return state[fused_state_idx(pitch, x, y, c)];
+}
+
+inline void fused_write_state(threadgroup float* state, int pitch, int x, int y,
+                              thread const float4& v0, thread const float4& v1,
+                              thread const float4& v2, thread const float4& v3,
+                              float scale) {
+    int base = fused_state_idx(pitch, x, y, 0);
+    state[base + 0] = v0.x * scale;
+    state[base + 1] = v0.y * scale;
+    state[base + 2] = v0.z * scale;
+    state[base + 3] = v0.w * scale;
+    state[base + 4] = v1.x * scale;
+    state[base + 5] = v1.y * scale;
+    state[base + 6] = v1.z * scale;
+    state[base + 7] = v1.w * scale;
+    state[base + 8] = v2.x * scale;
+    state[base + 9] = v2.y * scale;
+    state[base + 10] = v2.z * scale;
+    state[base + 11] = v2.w * scale;
+    state[base + 12] = v3.x * scale;
+    state[base + 13] = v3.y * scale;
+    state[base + 14] = v3.z * scale;
+    state[base + 15] = v3.w * scale;
+}
+
+inline float fused_alive_from_state(threadgroup const float* state, int pitch, int x, int y) {
+    float maxVal = -1e30f;
+    for (int ky = -1; ky <= 1; ++ky) {
+        for (int kx = -1; kx <= 1; ++kx) {
+            maxVal = max(maxVal, fused_read_state(state, pitch, x + kx, y + ky, 3));
+        }
+    }
+    return maxVal > 0.1f ? 1.0f : 0.0f;
+}
+
+inline float fused_alive_from_alpha(threadgroup const float* alpha, int pitch, int x, int y) {
+    float maxVal = -1e30f;
+    for (int ky = -1; ky <= 1; ++ky) {
+        for (int kx = -1; kx <= 1; ++kx) {
+            maxVal = max(maxVal, alpha[(y + ky) * pitch + (x + kx)]);
+        }
+    }
+    return maxVal > 0.1f ? 1.0f : 0.0f;
+}
+
+inline void fused_compute_perception(threadgroup const float* state, int pitch, int x, int y,
+                                     thread float perc[PERC]) {
+    for (int c = 0; c < C; ++c) {
+        float identity = fused_read_state(state, pitch, x, y, c);
+        float sx = 0.0f;
+        float sy = 0.0f;
+        for (int ky = -1; ky <= 1; ++ky) {
+            for (int kx = -1; kx <= 1; ++kx) {
+                float val = fused_read_state(state, pitch, x + kx, y + ky, c);
+                int k = (ky + 1) * 3 + (kx + 1);
+                sx += val * sobel_x[k];
+                sy += val * sobel_y[k];
+            }
+        }
+        int base = c * 3;
+        perc[base + 0] = identity;
+        perc[base + 1] = sx;
+        perc[base + 2] = sy;
+    }
+}
+
+inline float fused_compute_updated_alpha(threadgroup const float* state, int pitch, int x, int y,
+                                         device const float* fc1WT, device const float* fc1B,
+                                         device const float* fc2WT) {
+    thread float perc[PERC];
+    fused_compute_perception(state, pitch, x, y, perc);
+
+    float deltaAlpha = 0.0f;
+    for (int h = 0; h < HIDDEN; ++h) {
+        float hidden = fc1B[h];
+        for (int p = 0; p < PERC; ++p) {
+            hidden += perc[p] * fc1WT[p * HIDDEN + h];
+        }
+        if (hidden > 0.0f) {
+            deltaAlpha += hidden * fc2WT[h * C + 3];
+        }
+    }
+    return fused_read_state(state, pitch, x, y, 3) + deltaAlpha;
+}
+
+inline void fused_compute_updated_state(threadgroup const float* state, int pitch, int x, int y,
+                                        device const float* fc1WT, device const float* fc1B,
+                                        device const float* fc2WT,
+                                        thread float4& out0, thread float4& out1,
+                                        thread float4& out2, thread float4& out3) {
+    thread float perc[PERC];
+    fused_compute_perception(state, pitch, x, y, perc);
+
+    float4 delta0 = float4(0.0f);
+    float4 delta1 = float4(0.0f);
+    float4 delta2 = float4(0.0f);
+    float4 delta3 = float4(0.0f);
+
+    for (int h = 0; h < HIDDEN; ++h) {
+        float hidden = fc1B[h];
+        for (int p = 0; p < PERC; ++p) {
+            hidden += perc[p] * fc1WT[p * HIDDEN + h];
+        }
+        if (hidden <= 0.0f) continue;
+
+        const device float4* w0 = reinterpret_cast<const device float4*>(fc2WT + h * C + 0);
+        const device float4* w1 = reinterpret_cast<const device float4*>(fc2WT + h * C + 4);
+        const device float4* w2 = reinterpret_cast<const device float4*>(fc2WT + h * C + 8);
+        const device float4* w3 = reinterpret_cast<const device float4*>(fc2WT + h * C + 12);
+        delta0 += hidden * (*w0);
+        delta1 += hidden * (*w1);
+        delta2 += hidden * (*w2);
+        delta3 += hidden * (*w3);
+    }
+
+    out0 = float4(
+        fused_read_state(state, pitch, x, y, 0),
+        fused_read_state(state, pitch, x, y, 1),
+        fused_read_state(state, pitch, x, y, 2),
+        fused_read_state(state, pitch, x, y, 3)
+    ) + delta0;
+    out1 = float4(
+        fused_read_state(state, pitch, x, y, 4),
+        fused_read_state(state, pitch, x, y, 5),
+        fused_read_state(state, pitch, x, y, 6),
+        fused_read_state(state, pitch, x, y, 7)
+    ) + delta1;
+    out2 = float4(
+        fused_read_state(state, pitch, x, y, 8),
+        fused_read_state(state, pitch, x, y, 9),
+        fused_read_state(state, pitch, x, y, 10),
+        fused_read_state(state, pitch, x, y, 11)
+    ) + delta2;
+    out3 = float4(
+        fused_read_state(state, pitch, x, y, 12),
+        fused_read_state(state, pitch, x, y, 13),
+        fused_read_state(state, pitch, x, y, 14),
+        fused_read_state(state, pitch, x, y, 15)
+    ) + delta3;
+}
+
+// Forward rollout kernel that fuses two deterministic NCA steps into one dispatch.
+// This is exact up to float32 arithmetic order differences, but recomputes alpha halos.
+kernel void rollout_two_steps_fused(
+    device const float* stateIn [[buffer(0)]],
+    device const float* fc1WT   [[buffer(1)]],
+    device const float* fc1B    [[buffer(2)]],
+    device const float* fc2WT   [[buffer(3)]],
+    device float* stateOut      [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint3 tid [[thread_position_in_threadgroup]]
+) {
+    int b = int(tgid.z);
+    int outBaseX = int(tgid.x) * FUSED2_OUT_TILE;
+    int outBaseY = int(tgid.y) * FUSED2_OUT_TILE;
+    int inputBaseX = outBaseX - 4;
+    int inputBaseY = outBaseY - 4;
+
+    threadgroup float inputState[FUSED2_INPUT_TILE * FUSED2_INPUT_TILE * C];
+    threadgroup float step1State[FUSED2_STEP1_TILE * FUSED2_STEP1_TILE * C];
+    threadgroup float updatedAlpha14[FUSED2_ALPHA14_TILE * FUSED2_ALPHA14_TILE];
+    threadgroup float updatedAlpha10[FUSED2_ALPHA10_TILE * FUSED2_ALPHA10_TILE];
+
+    int linear = int(tid.y) * FUSED2_THREADS + int(tid.x);
+
+    for (int idx = linear; idx < FUSED2_INPUT_TILE * FUSED2_INPUT_TILE; idx += FUSED2_THREADS * FUSED2_THREADS) {
+        int lx = idx % FUSED2_INPUT_TILE;
+        int ly = idx / FUSED2_INPUT_TILE;
+        int gx = inputBaseX + lx;
+        int gy = inputBaseY + ly;
+        bool inBounds = gx >= 0 && gx < W && gy >= 0 && gy < H;
+        int localBase = fused_state_idx(FUSED2_INPUT_TILE, lx, ly, 0);
+        for (int c = 0; c < C; ++c) {
+            inputState[localBase + c] = inBounds ? stateIn[(b * C + c) * HW + gy * W + gx] : 0.0f;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int idx = linear; idx < FUSED2_ALPHA14_TILE * FUSED2_ALPHA14_TILE; idx += FUSED2_THREADS * FUSED2_THREADS) {
+        int ax = idx % FUSED2_ALPHA14_TILE;
+        int ay = idx / FUSED2_ALPHA14_TILE;
+        updatedAlpha14[idx] = fused_compute_updated_alpha(inputState, FUSED2_INPUT_TILE, ax + 1, ay + 1, fc1WT, fc1B, fc2WT);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int idx = linear; idx < FUSED2_STEP1_TILE * FUSED2_STEP1_TILE; idx += FUSED2_THREADS * FUSED2_THREADS) {
+        int sx = idx % FUSED2_STEP1_TILE;
+        int sy = idx / FUSED2_STEP1_TILE;
+        int px = sx + 2;
+        int py = sy + 2;
+        float preMask = fused_alive_from_state(inputState, FUSED2_INPUT_TILE, px, py);
+        float postMask = fused_alive_from_alpha(updatedAlpha14, FUSED2_ALPHA14_TILE, sx + 1, sy + 1);
+        float lifeMask = preMask * postMask;
+        if (lifeMask == 0.0f) {
+            int base = fused_state_idx(FUSED2_STEP1_TILE, sx, sy, 0);
+            for (int c = 0; c < C; ++c) {
+                step1State[base + c] = 0.0f;
+            }
+        } else {
+            float4 out0, out1, out2, out3;
+            fused_compute_updated_state(inputState, FUSED2_INPUT_TILE, px, py, fc1WT, fc1B, fc2WT, out0, out1, out2, out3);
+            fused_write_state(step1State, FUSED2_STEP1_TILE, sx, sy, out0, out1, out2, out3, lifeMask);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int idx = linear; idx < FUSED2_ALPHA10_TILE * FUSED2_ALPHA10_TILE; idx += FUSED2_THREADS * FUSED2_THREADS) {
+        int ax = idx % FUSED2_ALPHA10_TILE;
+        int ay = idx / FUSED2_ALPHA10_TILE;
+        updatedAlpha10[idx] = fused_compute_updated_alpha(step1State, FUSED2_STEP1_TILE, ax + 1, ay + 1, fc1WT, fc1B, fc2WT);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    int ox = int(tid.x);
+    int oy = int(tid.y);
+    int gx = outBaseX + ox;
+    int gy = outBaseY + oy;
+    if (gx >= W || gy >= H || b >= B) return;
+
+    float preMask = fused_alive_from_state(step1State, FUSED2_STEP1_TILE, ox + 2, oy + 2);
+    float postMask = fused_alive_from_alpha(updatedAlpha10, FUSED2_ALPHA10_TILE, ox + 1, oy + 1);
+    float lifeMask = preMask * postMask;
+
+    if (lifeMask == 0.0f) {
+        for (int c = 0; c < C; ++c) {
+            stateOut[(b * C + c) * HW + gy * W + gx] = 0.0f;
+        }
+    } else {
+        float4 out0, out1, out2, out3;
+        fused_compute_updated_state(step1State, FUSED2_STEP1_TILE, ox + 2, oy + 2, fc1WT, fc1B, fc2WT, out0, out1, out2, out3);
+        out0 *= lifeMask;
+        out1 *= lifeMask;
+        out2 *= lifeMask;
+        out3 *= lifeMask;
+
+        int base = (b * C) * HW + gy * W + gx;
+        stateOut[base + 0 * HW] = out0.x;
+        stateOut[base + 1 * HW] = out0.y;
+        stateOut[base + 2 * HW] = out0.z;
+        stateOut[base + 3 * HW] = out0.w;
+        stateOut[base + 4 * HW] = out1.x;
+        stateOut[base + 5 * HW] = out1.y;
+        stateOut[base + 6 * HW] = out1.z;
+        stateOut[base + 7 * HW] = out1.w;
+        stateOut[base + 8 * HW] = out2.x;
+        stateOut[base + 9 * HW] = out2.y;
+        stateOut[base + 10 * HW] = out2.z;
+        stateOut[base + 11 * HW] = out2.w;
+        stateOut[base + 12 * HW] = out3.x;
+        stateOut[base + 13 * HW] = out3.y;
+        stateOut[base + 14 * HW] = out3.z;
+        stateOut[base + 15 * HW] = out3.w;
+    }
+}
+
 // ---- BACKWARD KERNELS ----
 
 // Backward of masked_residual: given dOutput, compute dUpdated = dOutput * lifeMask
