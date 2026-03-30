@@ -16,6 +16,9 @@ output/*/loss.png
 output/*/analysis.png
 output/*/target_*.png
 
+# Experiment smoke test outputs
+output/_smoke_*/
+
 *.DS_Store*
 
 *.build*

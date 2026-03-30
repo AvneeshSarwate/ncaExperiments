@@ -9,6 +9,7 @@
 const GRID_W = 72;
 const GRID_H = 72;
 const CHANNELS = 16;
+const VISIBLE_CHANNELS = 4;
 const STATE_FLOATS = GRID_W * GRID_H * CHANNELS;
 const STATE_BYTES = STATE_FLOATS * 4;
 const NCA_SCALE = 8; // pixels per grid cell on the canvas
@@ -22,6 +23,7 @@ export class NCAViewer {
 
   private stateA!: GPUBuffer;
   private stateB!: GPUBuffer;
+  private readbackBuffer!: GPUBuffer;
   private weightsBuffer!: GPUBuffer;
   private modelBuffers = new Map<string, GPUBuffer>();
   private activeModelName: string | null = null;
@@ -74,6 +76,10 @@ export class NCAViewer {
       });
     this.stateA = makeStorage();
     this.stateB = makeStorage();
+    this.readbackBuffer = this.device.createBuffer({
+      size: STATE_BYTES,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    });
 
     this.paramsBuffer = this.device.createBuffer({
       size: 16,
@@ -135,7 +141,7 @@ export class NCAViewer {
     });
 
     this.addModel(initialModelName, weights);
-    this.setModel(initialModelName);
+    await this.setModel(initialModelName);
 
     // --- init seed ---
     this.reset();
@@ -154,15 +160,32 @@ export class NCAViewer {
     }
   }
 
-  setModel(name: string): void {
+  async setModel(name: string, preserveHiddenState = true): Promise<void> {
     const nextBuffer = this.modelBuffers.get(name);
     if (!nextBuffer) {
       throw new Error(`Unknown model: ${name}`);
     }
 
+    const wasRunning = this.running;
+    if (wasRunning) this.stop();
+
+    let nextState: Float32Array | null = null;
+    if (!preserveHiddenState) {
+      nextState = await this.readState();
+      this.zeroHiddenChannels(nextState);
+    }
+
     this.activeModelName = name;
     this.weightsBuffer = nextBuffer;
     this.rebuildComputeBindGroups();
+
+    if (nextState) {
+      const bytes = new Uint8Array(nextState.byteLength);
+      bytes.set(new Uint8Array(nextState.buffer, nextState.byteOffset, nextState.byteLength));
+      this.device.queue.writeBuffer(this.stateA, 0, bytes);
+    }
+
+    if (wasRunning) this.start();
   }
 
   get modelName(): string | null {
@@ -222,6 +245,7 @@ export class NCAViewer {
     this.stop();
     this.stateA.destroy();
     this.stateB.destroy();
+    this.readbackBuffer.destroy();
     for (const buffer of this.modelBuffers.values()) {
       buffer.destroy();
     }
@@ -315,6 +339,23 @@ export class NCAViewer {
       layout: this.computeBGL,
       entries: bindEntries(this.stateB, this.stateA),
     });
+  }
+
+  private async readState(): Promise<Float32Array> {
+    const encoder = this.device.createCommandEncoder();
+    encoder.copyBufferToBuffer(this.stateA, 0, this.readbackBuffer, 0, STATE_BYTES);
+    this.device.queue.submit([encoder.finish()]);
+
+    await this.readbackBuffer.mapAsync(GPUMapMode.READ);
+    const copy = new Float32Array(this.readbackBuffer.getMappedRange().slice(0));
+    this.readbackBuffer.unmap();
+    return copy;
+  }
+
+  private zeroHiddenChannels(state: Float32Array): void {
+    for (let base = 0; base < state.length; base += CHANNELS) {
+      state.fill(0, base + VISIBLE_CHANNELS, base + CHANNELS);
+    }
   }
 
   private bufferWithData(data: Float32Array, usage: GPUBufferUsageFlags): GPUBuffer {

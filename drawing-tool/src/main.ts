@@ -43,8 +43,9 @@ app.innerHTML = `
     <button id="nca-reset" disabled>Reset</button>
     <label>Steps/frame: <input type="range" id="steps-per-frame" min="1" max="16" value="4" disabled> <span id="spf-label">4</span></label>
     <label>Erase size: <input type="range" id="erase-size" min="8" max="80" value="32" disabled> <span id="erase-label">32</span>px</label>
+    <label><input type="checkbox" id="clear-hidden-on-swap" checked> Clear hidden channels on model swap</label>
   </div>
-  <div class="info" id="model-status">Switching models keeps the current NCA state.</div>
+  <div class="info" id="model-status">Switching models preserves RGBA and clears hidden channels.</div>
   <div class="nca-canvas-container">
     <canvas id="nca-canvas" width="${NCA_CANVAS_SIZE}" height="${NCA_CANVAS_SIZE}"></canvas>
   </div>
@@ -177,6 +178,7 @@ const statusEl = document.getElementById('nca-status')!;
 const modelStatusEl = document.getElementById('model-status')!;
 const modelNameInput = document.getElementById('model-name') as HTMLInputElement;
 const modelSelect = document.getElementById('model-select') as HTMLSelectElement;
+const clearHiddenOnSwapInput = document.getElementById('clear-hidden-on-swap') as HTMLInputElement;
 let viewer: NCAViewer | null = null;
 const loadedModels = new Map<string, Float32Array>();
 const EXPECTED_WEIGHTS = 8320;
@@ -214,14 +216,18 @@ function refreshModelSelect(activeName?: string): void {
 }
 
 function updateViewerStatus(): void {
+  const swapModeText = clearHiddenOnSwapInput.checked
+    ? 'Switching models preserves RGBA and clears hidden channels.'
+    : 'Switching models keeps the full current NCA state, including hidden channels.';
+
   if (!viewer || !viewer.modelName) {
     statusEl.textContent = 'Upload trained weights to start';
-    modelStatusEl.textContent = 'Switching models keeps the current NCA state.';
+    modelStatusEl.textContent = swapModeText;
     return;
   }
 
   statusEl.textContent = `Running model "${viewer.modelName}" — click the NCA canvas to erase`;
-  modelStatusEl.textContent = `${loadedModels.size} model${loadedModels.size === 1 ? '' : 's'} loaded. Switching models keeps the current NCA state.`;
+  modelStatusEl.textContent = `${loadedModels.size} model${loadedModels.size === 1 ? '' : 's'} loaded. ${swapModeText}`;
 }
 
 document.getElementById('weights-upload')!.addEventListener('change', async (e) => {
@@ -287,14 +293,25 @@ document.getElementById('weights-upload')!.addEventListener('change', async (e) 
   }
 });
 
-modelSelect.addEventListener('change', () => {
+clearHiddenOnSwapInput.addEventListener('change', () => {
+  updateViewerStatus();
+});
+
+modelSelect.addEventListener('change', async () => {
   if (!viewer || !modelSelect.value) return;
+
+  const nextModel = modelSelect.value;
+  statusEl.textContent = `Switching to "${nextModel}"...`;
+  modelSelect.disabled = true;
+
   try {
-    viewer.setModel(modelSelect.value);
+    await viewer.setModel(nextModel, !clearHiddenOnSwapInput.checked);
     updateViewerStatus();
   } catch (err) {
     statusEl.textContent = `Error: ${err}`;
     console.error(err);
+  } finally {
+    refreshModelSelect(viewer.modelName ?? nextModel);
   }
 });
 
